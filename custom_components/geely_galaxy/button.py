@@ -36,10 +36,19 @@ async def async_setup_entry(
         GeelyAcOffButton(coordinator, entry, api),
         GeelyWindowCloseButton(coordinator, entry, api),
         GeelyWindowVentButton(coordinator, entry, api),
+        GeelyWindowFullOpenButton(coordinator, entry, api),
         GeelyDefrostOnButton(coordinator, entry, api),
         GeelyDefrostOffButton(coordinator, entry, api),
         GeelyPurifierOnButton(coordinator, entry, api),
         GeelyPurifierOffButton(coordinator, entry, api),
+        GeelyQuickCoolOnButton(coordinator, entry, api),
+        GeelyQuickCoolOffButton(coordinator, entry, api),
+        GeelyQuickHeatOnButton(coordinator, entry, api),
+        GeelyQuickHeatOffButton(coordinator, entry, api),
+        GeelySeatVentOnButton(coordinator, entry, api),
+        GeelySeatVentOffButton(coordinator, entry, api),
+        GeelySeatHeatOnButton(coordinator, entry, api),
+        GeelySeatHeatOffButton(coordinator, entry, api),
     ]
 
     # 如果有家用充电桩，添加充电桩控制按钮
@@ -224,6 +233,26 @@ class GeelyWindowVentButton(GeelyBaseButton):
             _LOGGER.error("车窗微开失败: %s", err)
 
 
+class GeelyWindowFullOpenButton(GeelyBaseButton):
+    """Button to fully open all windows (车窗全开)."""
+
+    _attr_name = "车窗全开"
+    _attr_icon = "mdi:car-door-lock-open"
+
+    def __init__(self, coordinator, entry, api) -> None:
+        """Initialize."""
+        super().__init__(coordinator, entry, api)
+        self._attr_unique_id = f"{entry.entry_id}_btn_window_fullopen"
+
+    async def async_press(self) -> None:
+        """Fully open all windows."""
+        try:
+            await self._api.control_window(None, action="fullOpen")
+            await self.coordinator.async_request_refresh()
+        except Exception as err:
+            _LOGGER.error("车窗全开失败: %s", err)
+
+
 class GeelyDefrostOnButton(GeelyBaseButton):
     """Button to turn on defrost."""
 
@@ -302,6 +331,150 @@ class GeelyPurifierOffButton(GeelyBaseButton):
             await self.coordinator.async_request_refresh()
         except Exception as err:
             _LOGGER.error("关闭空气净化失败: %s", err)
+
+
+class GeelyQuickCoolOnButton(GeelyBaseButton):
+    """Button to turn on quick cooling (极速降温)."""
+
+    _attr_name = "极速降温"
+    _attr_icon = "mdi:snowflake-thermometer"
+
+    def __init__(self, coordinator, entry, api) -> None:
+        super().__init__(coordinator, entry, api)
+        self._attr_unique_id = f"{entry.entry_id}_btn_quick_cool_on"
+
+    async def async_press(self) -> None:
+        try:
+            await self._api.control_quick_cool(None, on=True)
+            await self.coordinator.async_request_refresh()
+        except Exception as err:
+            _LOGGER.error("极速降温失败: %s", err)
+
+
+class GeelyQuickCoolOffButton(GeelyBaseButton):
+    """Button to turn off quick cooling."""
+
+    _attr_name = "关闭极速降温"
+    _attr_icon = "mdi:snowflake-off"
+
+    def __init__(self, coordinator, entry, api) -> None:
+        super().__init__(coordinator, entry, api)
+        self._attr_unique_id = f"{entry.entry_id}_btn_quick_cool_off"
+
+    async def async_press(self) -> None:
+        try:
+            await self._api.control_quick_cool(None, on=False)
+            await self.coordinator.async_request_refresh()
+        except Exception as err:
+            _LOGGER.error("关闭极速降温失败: %s", err)
+
+
+class GeelyQuickHeatOnButton(GeelyBaseButton):
+    """Button to turn on quick heating (极速升温)."""
+
+    _attr_name = "极速升温"
+    _attr_icon = "mdi:fire"
+
+    def __init__(self, coordinator, entry, api) -> None:
+        super().__init__(coordinator, entry, api)
+        self._attr_unique_id = f"{entry.entry_id}_btn_quick_heat_on"
+
+    async def async_press(self) -> None:
+        try:
+            await self._api.control_quick_heat(None, on=True)
+            await self.coordinator.async_request_refresh()
+        except Exception as err:
+            _LOGGER.error("极速升温失败: %s", err)
+
+
+class GeelyQuickHeatOffButton(GeelyBaseButton):
+    """Button to turn off quick heating."""
+
+    _attr_name = "关闭极速升温"
+    _attr_icon = "mdi:fire-off"
+
+    def __init__(self, coordinator, entry, api) -> None:
+        super().__init__(coordinator, entry, api)
+        self._attr_unique_id = f"{entry.entry_id}_btn_quick_heat_off"
+
+    async def async_press(self) -> None:
+        try:
+            await self._api.control_quick_heat(None, on=False)
+            await self.coordinator.async_request_refresh()
+        except Exception as err:
+            _LOGGER.error("关闭极速升温失败: %s", err)
+
+
+class GeelySeatVentOnButton(GeelyBaseButton):
+    """Button to turn on seat ventilation (座椅通风开)."""
+
+    _attr_name = "座椅通风开"
+    _attr_icon = "mdi:car-seat-cooler"
+
+    def __init__(self, coordinator, entry, api) -> None:
+        super().__init__(coordinator, entry, api)
+        self._attr_unique_id = f"{entry.entry_id}_btn_seat_vent_on"
+
+    async def async_press(self) -> None:
+        try:
+            await self._api.control_seat_ventilation(None, on=True)
+            await self.coordinator.async_request_refresh()
+        except Exception as err:
+            _LOGGER.error("开启座椅通风失败: %s", err)
+
+
+class GeelySeatVentOffButton(GeelyBaseButton):
+    """Button to turn off seat ventilation (座椅通风关)."""
+
+    _attr_name = "座椅通风关"
+    _attr_icon = "mdi:car-seat-cooler"
+
+    def __init__(self, coordinator, entry, api) -> None:
+        super().__init__(coordinator, entry, api)
+        self._attr_unique_id = f"{entry.entry_id}_btn_seat_vent_off"
+
+    async def async_press(self) -> None:
+        try:
+            await self._api.control_seat_ventilation(None, on=False)
+            await self.coordinator.async_request_refresh()
+        except Exception as err:
+            _LOGGER.error("关闭座椅通风失败: %s", err)
+
+
+class GeelySeatHeatOnButton(GeelyBaseButton):
+    """Button to turn on seat heating (座椅加热开)."""
+
+    _attr_name = "座椅加热开"
+    _attr_icon = "mdi:car-seat-heater"
+
+    def __init__(self, coordinator, entry, api) -> None:
+        super().__init__(coordinator, entry, api)
+        self._attr_unique_id = f"{entry.entry_id}_btn_seat_heat_on"
+
+    async def async_press(self) -> None:
+        try:
+            await self._api.control_seat_heat(None, on=True)
+            await self.coordinator.async_request_refresh()
+        except Exception as err:
+            _LOGGER.error("开启座椅加热失败: %s", err)
+
+
+class GeelySeatHeatOffButton(GeelyBaseButton):
+    """Button to turn off seat heating (座椅加热关)."""
+
+    _attr_name = "座椅加热关"
+    _attr_icon = "mdi:car-seat-heater"
+
+    def __init__(self, coordinator, entry, api) -> None:
+        super().__init__(coordinator, entry, api)
+        self._attr_unique_id = f"{entry.entry_id}_btn_seat_heat_off"
+
+    async def async_press(self) -> None:
+        try:
+            await self._api.control_seat_heat(None, on=False)
+            await self.coordinator.async_request_refresh()
+        except Exception as err:
+            _LOGGER.error("关闭座椅加热失败: %s", err)
 
 
 class HomeChargerBaseButton(CoordinatorEntity, ButtonEntity):

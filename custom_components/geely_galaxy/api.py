@@ -1010,75 +1010,453 @@ class GeelyGalaxyApi:
     ) -> dict[str, Any]:
         """控制车辆开关（哨兵模式等）。
 
-        switch_type: "vstdMode" (哨兵), "strangerMode" (陌生人预警) 等
-        status: True=开启, False=关闭
+        switch_type: 参考上游实现，仅支持哨兵模式 type=6；
+                     预留 switch_type 参数兼容旧调用签名（忽略其值）。
+        status: True=开启(command=1), False=关闭(command=2)
         """
         vin = await self._ensure_vin(vin)
+        # 上游 jlyh.js 里哨兵/开关统一走 /control/switch，type=6 表示哨兵，
+        # command=1 开 / command=2 关；原 switchType/switchStatus 字段会被服务端
+        # 以 B00005 拒绝。
+        switch_type_map = {
+            # 兼容旧代码中可能传入的标识
+            "vstdMode": 6,
+            "sentry": 6,
+            "sentryMode": 6,
+        }
+        stype = switch_type_map.get(switch_type, 6)
         return await self._vc_post("/vc/app/v1/vehicle/control/switch", {
             "clientType": 2,
-            "switchType": switch_type,
-            "switchStatus": "1" if status else "0",
-            "vin": vin,
+            "command": "1" if status else "2",
+            "password": None,
             "tspUid": None,
+            "type": stype,
+            "udId": None,
+            "vin": vin,
         })
 
     async def control_door(self, vin: str | None, lock: bool) -> dict[str, Any]:
-        """控制车锁。lock=True 锁车，lock=False 解锁。"""
+        """控制车锁。lock=True 锁车(type=2)，lock=False 解锁(type=1)。"""
         vin = await self._ensure_vin(vin)
         return await self._vc_post("/vc/app/v1/vehicle/control/door", {
             "clientType": 2,
-            "doorCtrlType": 1 if lock else 0,
+            "lockPassword": None,
+            "password": None,
+            "platform": "2.0",
+            "position": 0,
+            "target": None,
+            "type": 2 if lock else 1,
+            "udId": None,
             "vin": vin,
         })
 
     async def control_ac(
-        self, vin: str | None, on: bool, temperature: float = 24.0
+        self, vin: str | None, on: bool, temperature: float | None = None
     ) -> dict[str, Any]:
-        """控制空调。on=True 开启，on=False 关闭。"""
+        """控制普通空调（开/关）。接口 /vc/app/v1/vehicle/control/climate。
+
+        与上游青龙脚本 jlyh.js controlClimate() 完全一致：
+          -  conditioner=1（普通空调）
+          -  type=1 开 / type=2 关
+          -  temp 为字符串，默认 25°C（与 jlyh.js 默认值一致）
+          -  duration=90 分钟
+        """
         vin = await self._ensure_vin(vin)
+        if temperature is None:
+            temperature = 25.0
         return await self._vc_post("/vc/app/v1/vehicle/control/climate", {
             "clientType": 2,
-            "climateCtrlType": 1 if on else 0,
-            "temperature": temperature,
+            "conditioner": 1,
+            "dayOfWeek": None,
+            "duration": 90,
+            "endTimeOfDay": None,
+            "heat": None,
+            "heatLevel": None,
+            "password": None,
+            "platform": "2.0",
+            "scheduledTime": None,
+            "startTimeOfDay": None,
+            "temp": str(temperature),
+            "timerId": None,
+            "type": 1 if on else 2,
+            "udId": None,
+            "ventilation": None,
+            "ventilationLevel": None,
             "vin": vin,
         })
+
+    async def control_temperature(
+        self, vin: str | None, mode: str
+    ) -> dict[str, Any]:
+        """极速降温/升温（开启）。接口 /vc/app/v1/vehicle/control/temperature，
+        与青龙脚本 jlyh.js controlTemperature() 完全对齐。
+
+        重要：本接口不只控制空调，还同时携带**座椅通风/座椅加热**参数
+        （paaVentilation / paaHeat），所以"关闭"也必须走本接口把对应字段清零，
+        仅调用 control_ac(on=False) 只能关空调、关不掉座椅通风（见 control_temperature_off）。
+
+        mode 取值：
+          - "rapidcool" : 极速降温，temp=15.5°C，座椅通风 [1,2] 3档（ventilationValue=3）
+          - "rapidheat" : 极速升温，temp=28.5°C，座椅加热 [1,2] 3档（heatValue=3）
+        """
+        vin = await self._ensure_vin(vin)
+        presets = {
+            "rapidcool": {
+                "temp": 15.5,
+                "heat": None,
+                "heatValue": None,
+                "ventilation": [1, 2],
+                "ventilationValue": 3,
+            },
+            "rapidheat": {
+                "temp": 28.5,
+                "heat": [1, 2],
+                "heatValue": 3,
+                "ventilation": None,
+                "ventilationValue": None,
+            },
+        }
+        p = presets.get(mode)
+        if p is None:
+            raise GeelyApiError(f"未知极速模式: {mode}")
+        return await self._vc_post("/vc/app/v1/vehicle/control/temperature", {
+            "clientType": 2,
+            "dayOfWeek": None,
+            "duration": 90,
+            "paa": 0,
+            "paaAc": True,
+            "paaAcTemp": p["temp"],
+            "paaHeat": p["heat"],
+            "paaHeatValue": p["heatValue"],
+            "paaSw": None,
+            "paaVentilation": p["ventilation"],
+            "paaVentilationValue": p["ventilationValue"],
+            "paaVlt": p["ventilation"] is not None,
+            "paaVltDuration": 60,
+            "paaVltPos": None,
+            "password": None,
+            "platform": "2.0",
+            "scheduledTime": int(time.time() * 1000),
+            "startTimeOfDay": None,
+            "timerActivation": None,
+            "timerId": None,
+            "type": 3,
+            "udId": None,
+            "vin": vin,
+        })
+
+    async def control_temperature_off(
+        self,
+        vin: str | None,
+        *,
+        ventilation: bool = False,
+        heat: bool = False,
+        ac: bool = True,
+        seats: list[int] | None = None,
+    ) -> dict[str, Any]:
+        """关闭"极速降温/升温"里由 paa 字段打开的座椅通道（走 /control/temperature）。
+
+        注意（v9 修正）：jlyh.js 实际只实现了极速"开启"两个模式，没有实现
+        "关闭座椅通风/加热"的独立接口。经实测中台不接受档位 value=0 / duration=0
+        （报 VC056024 中台参数校验失败），必须按 jlyh.js 约定把对应字段置为 null。
+        因此关闭策略是：把所有座椅/预空调字段置为 null（=不在该通道发指令）+
+        paaVlt=false，然后再用 control_ac(on=False) 关空调兜底。座椅通风若仍未关闭，
+        将在 paaVltDuration=60 分钟到期后自动停止（APP 本身也是如此）。
+
+        参数：
+          - ventilation : True 时把 paaVentilation 字段明确置 null（不在该通道发指令）
+          - heat        : True 时把 paaHeat 字段明确置 null
+          - ac          : True 时 paaAc=false（关掉预空调）
+          - seats       : 座椅位置，默认 [1, 2]；中台接受 null 即可
+        """
+        vin = await self._ensure_vin(vin)
+        # jlyh.js 的约定：不想操作的字段一律传 null，不能传 0
+        return await self._vc_post("/vc/app/v1/vehicle/control/temperature", {
+            "clientType": 2,
+            "dayOfWeek": None,
+            "duration": None,
+            "paa": 0,
+            "paaAc": False if ac else None,
+            "paaAcTemp": None,
+            "paaHeat": None,
+            "paaHeatValue": None,
+            "paaSw": None,
+            "paaVentilation": None,
+            "paaVentilationValue": None,
+            "paaVlt": False,
+            "paaVltDuration": None,
+            "paaVltPos": None,
+            "password": None,
+            "platform": "2.0",
+            "scheduledTime": int(time.time() * 1000),
+            "startTimeOfDay": None,
+            "timerActivation": None,
+            "timerId": None,
+            "type": 3,
+            "udId": None,
+            "vin": vin,
+        })
+
+    async def control_seat_ventilation(
+        self,
+        vin: str | None,
+        on: bool,
+        level: int = 3,
+        seats: list[int] | None = None,
+    ) -> dict[str, Any]:
+        """座椅通风 开/关（走 /control/temperature，只动座椅通风，不动空调）。
+
+        v9 修正：关闭时按 jlyh.js 约定把所有 paa 字段置 null、paaVlt=false，
+        不能传 value=0/duration=0（中台 VC056024 参数校验失败）。
+        """
+        vin = await self._ensure_vin(vin)
+        seat_positions = seats if seats is not None else [1, 2]
+        if on:
+            body = {
+                "clientType": 2,
+                "dayOfWeek": None,
+                "duration": 60,
+                "paa": 0,
+                "paaAc": None,
+                "paaAcTemp": None,
+                "paaHeat": None,
+                "paaHeatValue": None,
+                "paaSw": None,
+                "paaVentilation": seat_positions,
+                "paaVentilationValue": level,
+                "paaVlt": True,
+                "paaVltDuration": 60,
+                "paaVltPos": None,
+                "password": None,
+                "platform": "2.0",
+                "scheduledTime": int(time.time() * 1000),
+                "startTimeOfDay": None,
+                "timerActivation": None,
+                "timerId": None,
+                "type": 3,
+                "udId": None,
+                "vin": vin,
+            }
+        else:
+            body = {
+                "clientType": 2,
+                "dayOfWeek": None,
+                "duration": None,
+                "paa": 0,
+                "paaAc": None,
+                "paaAcTemp": None,
+                "paaHeat": None,
+                "paaHeatValue": None,
+                "paaSw": None,
+                "paaVentilation": None,
+                "paaVentilationValue": None,
+                "paaVlt": False,
+                "paaVltDuration": None,
+                "paaVltPos": None,
+                "password": None,
+                "platform": "2.0",
+                "scheduledTime": int(time.time() * 1000),
+                "startTimeOfDay": None,
+                "timerActivation": None,
+                "timerId": None,
+                "type": 3,
+                "udId": None,
+                "vin": vin,
+            }
+        return await self._vc_post("/vc/app/v1/vehicle/control/temperature", body)
+
+    async def control_seat_heat(
+        self,
+        vin: str | None,
+        on: bool,
+        level: int = 3,
+        seats: list[int] | None = None,
+    ) -> dict[str, Any]:
+        """座椅加热 开/关（走 /control/temperature，只动座椅加热，不动空调）。
+
+        v9 修正：关闭时按 jlyh.js 约定把所有 paa 字段置 null，不能传 value=0/duration=0。
+        """
+        vin = await self._ensure_vin(vin)
+        seat_positions = seats if seats is not None else [1, 2]
+        if on:
+            body = {
+                "clientType": 2,
+                "dayOfWeek": None,
+                "duration": 60,
+                "paa": 0,
+                "paaAc": None,
+                "paaAcTemp": None,
+                "paaHeat": seat_positions,
+                "paaHeatValue": level,
+                "paaSw": None,
+                "paaVentilation": None,
+                "paaVentilationValue": None,
+                "paaVlt": False,
+                "paaVltDuration": None,
+                "paaVltPos": None,
+                "password": None,
+                "platform": "2.0",
+                "scheduledTime": int(time.time() * 1000),
+                "startTimeOfDay": None,
+                "timerActivation": None,
+                "timerId": None,
+                "type": 3,
+                "udId": None,
+                "vin": vin,
+            }
+        else:
+            body = {
+                "clientType": 2,
+                "dayOfWeek": None,
+                "duration": None,
+                "paa": 0,
+                "paaAc": None,
+                "paaAcTemp": None,
+                "paaHeat": None,
+                "paaHeatValue": None,
+                "paaSw": None,
+                "paaVentilation": None,
+                "paaVentilationValue": None,
+                "paaVlt": False,
+                "paaVltDuration": None,
+                "paaVltPos": None,
+                "password": None,
+                "platform": "2.0",
+                "scheduledTime": int(time.time() * 1000),
+                "startTimeOfDay": None,
+                "timerActivation": None,
+                "timerId": None,
+                "type": 3,
+                "udId": None,
+                "vin": vin,
+            }
+        return await self._vc_post("/vc/app/v1/vehicle/control/temperature", body)
+
+    async def control_quick_cool(self, vin: str | None, on: bool) -> dict[str, Any]:
+        """极速降温。
+
+        开启 = /control/temperature (rapidcool)；
+        关闭 = 先经 /control/temperature 关掉座椅通风，再关空调。
+
+        （v8 修复：旧版关闭只发"关空调"，而座椅通风是极速降温通过 paaVentilation/
+          paaVlt 打开的独立通道，因此关闭后座椅通风仍然在转。）
+        """
+        if on:
+            return await self.control_temperature(vin, "rapidcool")
+        await self.control_temperature_off(
+            vin, ventilation=True, heat=False, ac=True
+        )
+        return await self.control_ac(vin, on=False)
+
+    async def control_quick_heat(self, vin: str | None, on: bool) -> dict[str, Any]:
+        """极速升温。
+
+        开启 = /control/temperature (rapidheat)；
+        关闭 = 先经 /control/temperature 关掉座椅加热，再关空调。
+        """
+        if on:
+            return await self.control_temperature(vin, "rapidheat")
+        await self.control_temperature_off(
+            vin, ventilation=False, heat=True, ac=True
+        )
+        return await self.control_ac(vin, on=False)
 
     async def control_search(self, vin: str | None) -> dict[str, Any]:
         """闪灯鸣笛寻车。"""
         vin = await self._ensure_vin(vin)
         return await self._vc_post("/vc/app/v1/vehicle/control/search", {
             "clientType": 2,
-            "searchType": 0,
+            "password": None,
+            "platform": "2.0",
+            "udId": None,
+            "value": "3",
             "vin": vin,
         })
 
     async def control_window(
         self, vin: str | None, action: str
     ) -> dict[str, Any]:
-        """控制车窗。action: "close", "lightOpen" (微开), "fullOpen" (全开)。"""
+        """控制车窗。
+
+        action 取值（与上游 jlyh.js 一致，position=3 为遮阳帘）：
+          - "close"            : 关闭车窗  (position=[1], type=2)
+          - "lightOpen"        : 微开车窗  (position=[4], type=1)
+          - "fullOpen"         : 全开车窗  (position=[1], type=1)
+          - "sunroofOpen"      : 开天窗    (position=[2], type=1)
+          - "sunroofClose"     : 关天窗    (position=[2], type=2)
+          - "sunshadeOpen"     : 开遮阳帘  (position=[3], type=1)
+          - "sunshadeClose"    : 关遮阳帘  (position=[3], type=2)
+        """
         vin = await self._ensure_vin(vin)
-        action_map = {"close": 1, "lightOpen": 2, "fullOpen": 3}
+        action_map = {
+            # 车窗
+            "close":        {"position": [1], "type": 2, "name": "关闭车窗"},
+            "lightOpen":    {"position": [4], "type": 1, "name": "微开车窗"},
+            "fullOpen":     {"position": [1], "type": 1, "name": "全开车窗"},
+            # 天窗
+            "sunroofOpen":  {"position": [2], "type": 1, "name": "开天窗"},
+            "sunroofClose": {"position": [2], "type": 2, "name": "关天窗"},
+            # 遮阳帘
+            "sunshadeOpen": {"position": [3], "type": 1, "name": "开遮阳帘"},
+            "sunshadeClose":{"position": [3], "type": 2, "name": "关遮阳帘"},
+        }
+        params = action_map.get(action, action_map["close"])
         return await self._vc_post("/vc/app/v1/vehicle/control/window", {
             "clientType": 2,
-            "windowCtrlType": action_map.get(action, 1),
+            "password": None,
+            "percent": None,
+            "platform": "2.0",
+            "position": params["position"],
+            "type": params["type"],
+            "udId": None,
             "vin": vin,
         })
 
     async def control_defrost(self, vin: str | None, on: bool) -> dict[str, Any]:
-        """控制除霜。"""
+        """控制除霜（conditioner=2）。"""
         vin = await self._ensure_vin(vin)
-        return await self._vc_post("/vc/app/v1/vehicle/control/noEngine", {
+        return await self._vc_post("/vc/app/v1/vehicle/control/climate", {
             "clientType": 2,
-            "noEngineCtrlType": 3 if on else 4,
+            "conditioner": 2,
+            "dayOfWeek": None,
+            "duration": 90,
+            "endTimeOfDay": None,
+            "heat": None,
+            "heatLevel": None,
+            "password": None,
+            "platform": "2.0",
+            "scheduledTime": None,
+            "startTimeOfDay": None,
+            "temp": "24",
+            "timerId": None,
+            "type": 1 if on else 2,
+            "udId": None,
+            "ventilation": None,
+            "ventilationLevel": None,
             "vin": vin,
         })
 
     async def control_purifier(self, vin: str | None, on: bool) -> dict[str, Any]:
-        """控制空气净化。"""
+        """控制空气净化（走 /control/noEngine，ventilation=99）。"""
         vin = await self._ensure_vin(vin)
         return await self._vc_post("/vc/app/v1/vehicle/control/noEngine", {
             "clientType": 2,
-            "noEngineCtrlType": 1 if on else 2,
+            "conditioner": None,
+            "dayOfWeek": None,
+            "duration": None,
+            "endTimeOfDay": None,
+            "heat": None,
+            "level": None,
+            "password": None,
+            "platform": "2.0",
+            "scheduledTime": None,
+            "startTimeOfDay": None,
+            "target": None,
+            "temp": None,
+            "timerId": None,
+            "type": 1 if on else 2,
+            "udId": None,
+            "ventilation": 99,
             "vin": vin,
         })
 

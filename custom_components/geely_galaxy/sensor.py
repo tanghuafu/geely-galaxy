@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -30,6 +31,267 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# 油量字段自动发现
+#
+# 不同车型的状态接口返回结构并不完全一致：
+#   * VC 结构（/vc/app/v1/vehicle/control/status，A7/E5 等新车型）：
+#       basicVehicleStatus / vehicleRunningStatus / vehicleBatteryStatus / ...
+#   * XCHANGER 结构（/remote-control/vehicle/status/{vin}，L7 等）：
+#       additionalVehicleStatus.runningStatus.fuelLevelPct / fuelLevel
+#     集成会把 XCHANGER 数据转换后放进 _xchanger_extra。
+#
+# 这里不写死某一车型的字段路径，而是在整棵状态树里按
+# 「精确字段名 -> 字段名包含关系」两级策略搜索，最大化兼容性。
+# ---------------------------------------------------------------------------
+
+# 油量百分比候选字段名（小写、精确匹配）
+_FUEL_PCT_KEYS = (
+    "fuellevelpct", "fuelpercent", "fuelpercentage", "fuelpct",
+    "fuellevelpercentage", "oillevelpct", "oilpercent", "fueltanklevelpct",
+)
+# 油量容积/升候选字段名
+_FUEL_VOLUME_KEYS = (
+    "fuelvolume", "fuellevel", "fuelliters", "fuellitres", "fuelamount",
+    "oillevel", "fueltanklevel", "fuelcapacity",
+)
+# 燃油续航候选字段名
+_FUEL_RANGE_KEYS = (
+    "distancetoempty", "fuelrange", "distancetoemptyonfuelonly",
+    "fueldistancetoempty", "oilrange", "fuelremainingrange",
+)
+# 纯电续航候选字段名
+_EV_RANGE_KEYS = (
+    "distancetoemptyonbatteryonly", "electricrange", "evrange",
+    "distancetoemptyonbattery",
+)
+
+
+def _walk_pairs(node: Any):
+    """递归遍历嵌套 dict/list，产出所有 (key, value) 键值对。"""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield key, value
+            if isinstance(value, (dict, list)):
+                yield from _walk_pairs(value)
+    elif isinstance(node, list):
+        for item in node:
+            if isinstance(item, (dict, list)):
+                yield from _walk_pairs(item)
+
+
+def _iter_pairs_bfs(node: Any):
+    """广度优先遍历，优先命中层级较浅的字段。"""
+    queue = deque([node])
+    while queue:
+        current = queue.popleft()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                yield key, value
+                if isinstance(value, (dict, list)):
+                    queue.append(value)
+        elif isinstance(current, list):
+            for item in current:
+                if isinstance(item, (dict, list)):
+                    queue.append(item)
+
+
+def _to_float(value: Any) -> float | None:
+    """把候选值转成 float，无法转换时返回 None。"""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _find_by_keys(
+    status: dict[str, Any], keys: tuple[str, ...]
+) -> tuple[float | None, str | None]:
+    """按字段名精确匹配（忽略大小写）查找第一个数值。"""
+    for key, value in _iter_pairs_bfs(status):
+        if isinstance(key, str) and key.lower() in keys:
+            number = _to_float(value)
+            if number is not None:
+                return number, key
+    return None, None
+
+
+def _find_by_hint(
+    status: dict[str, Any],
+    required: tuple[str, ...],
+    excluded: tuple[str, ...] = (),
+    allowed: tuple[str, ...] = (),
+) -> tuple[float | None, str | None]:
+    """按字段名包含关系兜底查找数值（应对未收录的字段命名）。"""
+    for key, value in _iter_pairs_bfs(status):
+        if not isinstance(key, str):
+            continue
+        low = key.lower()
+        if any(part in low for part in excluded):
+            continue
+        if not all(part in low for part in required):
+            continue
+        if allowed and not any(part in low for part in allowed):
+            continue
+        number = _to_float(value)
+        if number is not None:
+            return number, key
+    return None, None
+
+
+def _find_hinted_multi(
+    status: dict[str, Any],
+    roots: tuple[str, ...],
+    excluded: tuple[str, ...] = (),
+    allowed: tuple[str, ...] = (),
+) -> tuple[float | None, str | None]:
+    """在多个词根（fuel / oil 等）下依次按名称包含关系兜底查找。"""
+    for root in roots:
+        value, key = _find_by_hint(
+            status, (root,), excluded=excluded, allowed=allowed
+        )
+        if value is not None:
+            return value, key
+    return None, None
+
+
+def discover_fuel(status: dict[str, Any]) -> dict[str, Any]:
+    """在车辆状态里自动发现油量数据。
+
+    返回 dict:
+        pct          油量百分比（0-100）
+        volume       油量容积（升）
+        range        燃油续航（km）
+        pct_key      命中的百分比字段名
+        volume_key   命中的容积字段名
+        range_key    命中的续航字段名
+        found        是否找到任一油量数据
+        source       命中的字段名（便于排查）
+    """
+    result: dict[str, Any] = {
+        "pct": None, "volume": None, "range": None,
+        "pct_key": None, "volume_key": None, "range_key": None,
+        "found": False, "source": None,
+    }
+    if not isinstance(status, dict) or not status:
+        return result
+
+    # 油量百分比
+    pct, pct_key = _find_by_keys(status, _FUEL_PCT_KEYS)
+    if pct is None:
+        pct, pct_key = _find_hinted_multi(
+            status, ("fuel", "oil"),
+            excluded=("type", "capacity", "spec", "grade", "door"),
+            allowed=("pct", "percent", "ratio"),
+        )
+
+    # 油量容积（升）
+    volume, volume_key = _find_by_keys(status, _FUEL_VOLUME_KEYS)
+    if volume is None:
+        volume, volume_key = _find_hinted_multi(
+            status, ("fuel", "oil"),
+            excluded=("type", "pct", "percent", "range", "distance", "spec",
+                      "door", "consumption", "price", "cost", "rate"),
+            allowed=("level", "volume", "amount", "liter", "litre", "tank", "remaining"),
+        )
+
+    # 燃油续航
+    range_km, range_key = _find_by_keys(status, _FUEL_RANGE_KEYS)
+    if range_km is None:
+        range_km, range_key = _find_hinted_multi(
+            status, ("fuel", "oil"),
+            excluded=("type", "pct", "percent", "level", "volume", "amount",
+                      "tank", "capacity", "door"),
+            allowed=("range", "distance", "empty"),
+        )
+
+    result["pct"] = pct
+    result["volume"] = volume
+    result["range"] = range_km
+    result["pct_key"] = pct_key
+    result["volume_key"] = volume_key
+    result["range_key"] = range_key
+    result["found"] = any(v is not None for v in (pct, volume, range_km))
+    result["source"] = pct_key or volume_key or range_key
+    return result
+
+
+def discover_ev_range(status: dict[str, Any]) -> float | None:
+    """查找纯电续航（优先精确字段，其次按名称包含）。"""
+    value, _ = _find_by_keys(status, _EV_RANGE_KEYS)
+    if value is not None:
+        return value
+    value, _ = _find_by_hint(status, ("battery", "range"))
+    if value is None:
+        value, _ = _find_by_hint(status, ("electric", "range"))
+    return value
+
+
+def _has_fuel_indicator(status: dict[str, Any], info: dict[str, Any]) -> bool:
+    """判断车辆是否属于燃油/插混车型（决定是否注册油量传感器）。"""
+    if isinstance(status, dict):
+        for key, value in _walk_pairs(status):
+            if not isinstance(key, str):
+                continue
+            low = key.lower()
+            # fuelType 单独看取值，避免纯电车型被 configuration.fuelType 误判
+            if low == "fueltype":
+                text = str(value).lower()
+                if any(t in text for t in ("electric", "ev", "纯电")):
+                    continue
+                if value not in (None, "", "0"):
+                    return True
+                continue
+            if "fuel" in low:
+                return True
+            if low in ("enginestatus", "enginespeed", "engine_status") and value not in (None, "", "engine-off"):
+                return True
+    if isinstance(info, dict):
+        for value in info.values():
+            if not isinstance(value, str):
+                continue
+            text = value.lower()
+            if any(t in text for t in ("phev", "em-i", "emi", "插混", "混动", "dm-i", "hybrid")):
+                return True
+    return False
+
+
+def _log_fuel_diagnostics(status: dict[str, Any], fuel: dict[str, Any]) -> None:
+    """输出一次油量字段诊断日志，便于定位不同车型的字段命名。"""
+    if fuel["found"]:
+        _LOGGER.warning(
+            "[油量诊断] 已识别油量字段: 百分比=%s (%s), 容积=%s (%s), 燃油续航=%s (%s)",
+            fuel["pct"], fuel["pct_key"],
+            fuel["volume"], fuel["volume_key"],
+            fuel["range"], fuel["range_key"],
+        )
+        return
+
+    top_keys = list(status.keys()) if isinstance(status, dict) else status
+    _LOGGER.warning("[油量诊断] 未找到油量字段，车辆状态顶层字段: %s", top_keys)
+    sections: dict[str, Any] = {}
+    if isinstance(status, dict):
+        for key, value in status.items():
+            if isinstance(value, dict):
+                sections[key] = list(value.keys())
+    _LOGGER.warning("[油量诊断] 各分区子字段: %s", sections)
+
+    # 兜底：把整棵状态树的字段名摊平打出来，便于确认该车型真实的油量字段名
+    flat_keys = [k for k, _ in _walk_pairs(status) if isinstance(k, str)]
+    _LOGGER.warning(
+        "[油量诊断] 状态树全部字段名(%d): %s", len(flat_keys), flat_keys[:200],
+    )
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -38,9 +300,31 @@ async def async_setup_entry(
     """Set up Geely Galaxy sensors based on a config entry."""
     coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
 
-    # 判断是否为 XCHANGER 车型（L7 等 PHEV）
+    # 车辆状态/信息
     vehicle_status = coordinator.data.get("vehicle_status", {}) if coordinator.data else {}
+    vehicle_info = coordinator.data.get("vehicle_info", {}) if coordinator.data else {}
+
+    # 是否为 XCHANGER 通道车型（L7 等）
     is_xchanger = bool(vehicle_status.get("_xchanger_extra"))
+
+    # 是否为燃油/插混车型：决定是否注册油量相关传感器
+    # 注意：distanceToEmpty 在纯电车型上表示总续航，有歧义，
+    # 因此不能仅凭它能解析出「续航」就判定为燃油车，
+    # 必须以油量百分比/容积或燃油特征字段（fuel*/engine*）为准。
+    fuel = discover_fuel(vehicle_status)
+    fuel_vehicle = (
+        is_xchanger
+        or fuel["pct"] is not None
+        or fuel["volume"] is not None
+        or _has_fuel_indicator(vehicle_status, vehicle_info)
+    )
+    if fuel_vehicle:
+        _log_fuel_diagnostics(vehicle_status, fuel)
+    else:
+        _LOGGER.debug(
+            "[油量诊断] 判定为非燃油车型，不注册油量传感器；状态顶层字段: %s",
+            list(vehicle_status.keys()) if isinstance(vehicle_status, dict) else vehicle_status,
+        )
 
     entities: list[GeelyBaseSensor] = [
         # 基础信息
@@ -60,6 +344,7 @@ async def async_setup_entry(
         GeelyPowerConsumptionSensor(coordinator, entry),
         # 状态
         GeelyDoorLockSensor(coordinator, entry),
+        GeelyTrunkLockSensor(coordinator, entry),
         GeelyAcStatusSensor(coordinator, entry),
         # 充电相关
         GeelyChargingStatusSensor(coordinator, entry),
@@ -77,12 +362,17 @@ async def async_setup_entry(
             GeelyChargeReservationSensor(coordinator, entry),
         ])
 
-    # XCHANGER 车型专用传感器（L7 等 PHEV）
-    if is_xchanger:
+    # 燃油/插混车型通用传感器（VC 与 XCHANGER 通道都注册）
+    if fuel_vehicle:
         entities.extend([
             GeelyCombinedRangeSensor(coordinator, entry),
             GeelyFuelRangeSensor(coordinator, entry),
             GeelyFuelLevelSensor(coordinator, entry),
+        ])
+
+    # XCHANGER 车型专用传感器（L7 等 PHEV 四轮胎压）
+    if is_xchanger:
+        entities.extend([
             GeelyTirePressureSensor(coordinator, entry, "driver", "左前"),
             GeelyTirePressureSensor(coordinator, entry, "passenger", "右前"),
             GeelyTirePressureSensor(coordinator, entry, "driver_rear", "左后"),
@@ -297,7 +587,11 @@ class GeelyBatteryLevelSensor(GeelyBaseSensor):
         battery_status = self.vehicle_status.get("vehicleBatteryStatus", {})
         level = battery_status.get("chargeLevel")
         if level is not None:
-            return int(level)
+            try:
+                # 车端可能返回 "80.0" 这类浮点字符串，先转 float 再转 int
+                return int(float(level))
+            except (TypeError, ValueError):
+                return None
         return None
 
     @property
@@ -528,6 +822,78 @@ class GeelyDoorLockSensor(GeelyBaseSensor):
         if self.native_value == "已锁定":
             return "mdi:car-door-lock"
         return "mdi:car-door"
+
+
+class GeelyTrunkLockSensor(GeelyBaseSensor):
+    """Sensor for trunk lock/door status (后备箱状态，仅读取，不控制).
+
+    重要说明：
+    1. 三个公开参考项目（lyj5812/geely-galaxy、kooritea/geely_galaxy_ha、
+       suyunkai/geely-galaxy-assistant）均未实现银河 A7 的尾箱远程控制：
+       - suyunkai/jlyh.js 里 control/door 的 position 固定为 0（仅控制全车门锁），
+         没有任何尾门控制调用；全部接口列表里也不存在 /trunk /tailgate 接口；
+       - kooritea 的 RTU 指令走 device-api.xchanger.cn（老车型 XCHANGER 通道），
+         银河 A7 不通该域名；
+       - lyj5812 原仓库未实现后备箱控制，之前误加的 position=1 实测会解锁主驾车门。
+    2. 当前版本仅显示状态，不提供控制开关，避免误解锁车门造成安全隐患。
+       尾门远程控制接口需要抓包获取真实请求路径和参数后才能正确实现。
+    3. 字段映射（与 jlyh.js 实测一致）：trunkLockStatus '1'=已解锁, '2'=已锁定。
+       该字段是"锁止"状态，不等同于尾门物理开启；为避免误报只输出锁状态。
+    """
+
+    _attr_name = "后备箱状态"
+    _attr_icon = "mdi:car-back"
+
+    def __init__(self, coordinator: DataUpdateCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.entry_id}_trunk_lock"
+
+    @property
+    def native_value(self) -> str | None:
+        """Return the trunk lock/door status."""
+        door_status = self.vehicle_status.get("vehicleDoorCoverStatus", {})
+        lock = door_status.get("trunkLockStatus")
+        # VC通道 trunkLockStatus 实测映射：'1'=锁定（关闭锁止）, '2'=解锁（可能已开启）
+        # 同时兼容物理开启状态字段（若服务端返回）
+        open_status = door_status.get("trunkOpenStatus") or door_status.get("trunkStatus")
+        if open_status is not None:
+            if open_status in ("1", True, "true", "open"):
+                return "已开启"
+            elif open_status in ("0", "2", False, "false", "closed"):
+                return "已关闭"
+        # 回退到锁状态判断
+        if lock == "1":
+            return "已锁定/关闭"
+        elif lock == "2":
+            return "已解锁"
+        return None
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Return extra attributes with raw fields for diagnostics."""
+        door_status = self.vehicle_status.get("vehicleDoorCoverStatus", {})
+        return {
+            "trunkLockStatus_raw": door_status.get("trunkLockStatus"),
+            "trunkOpenStatus_raw": door_status.get("trunkOpenStatus"),
+            "tailgateOpenStatus_raw": door_status.get("tailgateOpenStatus"),
+            "raw_fields": sorted(
+                [
+                    k
+                    for k in door_status.keys()
+                    if "trunk" in k.lower() or "boot" in k.lower() or "tailgate" in k.lower()
+                ]
+            ),
+            "vehicleDoorCoverStatus_raw": door_status,
+        }
+
+    @property
+    def icon(self) -> str:
+        """Return icon based on status."""
+        val = self.native_value
+        if val and ("开启" in val or "解锁" in val):
+            return "mdi:car-back"
+        return "mdi:car-side"
 
 
 class GeelyAcStatusSensor(GeelyBaseSensor):
@@ -970,12 +1336,15 @@ class GeelyCombinedRangeSensor(GeelyBaseSensor):
     @property
     def native_value(self) -> int | None:
         """Return the combined range (electric + fuel)."""
-        basic_status = self.vehicle_status.get("basicVehicleStatus", {})
-        electric = basic_status.get("distanceToEmptyOnBatteryOnly")
-        fuel = basic_status.get("distanceToEmpty")
-        if electric is not None and fuel is not None:
-            return int(electric) + int(fuel)
-        return None
+        status = self.vehicle_status
+        electric = discover_ev_range(status)
+        fuel_range = discover_fuel(status)["range"]
+
+        values = [v for v in (electric, fuel_range) if v is not None]
+        if not values:
+            return None
+        # 只有一项可用时直接返回该项，避免综合续航变成未知
+        return round(sum(values))
 
 
 class GeelyFuelRangeSensor(GeelyBaseSensor):
@@ -995,18 +1364,23 @@ class GeelyFuelRangeSensor(GeelyBaseSensor):
     @property
     def native_value(self) -> int | None:
         """Return the fuel-only range."""
-        basic_status = self.vehicle_status.get("basicVehicleStatus", {})
-        range_value = basic_status.get("distanceToEmpty")
-        if range_value is not None:
-            return int(range_value)
-        return None
+        status = self.vehicle_status
+
+        value = discover_fuel(status)["range"]
+        if value is None:
+            # 常见位置的兜底（VC 与 XCHANGER 转换后都放在此路径）
+            basic_status = status.get("basicVehicleStatus", {})
+            value = _to_float(basic_status.get("distanceToEmpty"))
+
+        if value is None:
+            return None
+        return round(value)
 
 
 class GeelyFuelLevelSensor(GeelyBaseSensor):
     """Sensor for fuel level (PHEV)."""
 
     _attr_name = "油量"
-    _attr_native_unit_of_measurement = PERCENTAGE
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_icon = "mdi:gas-station"
 
@@ -1015,23 +1389,41 @@ class GeelyFuelLevelSensor(GeelyBaseSensor):
         super().__init__(coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_fuel_level"
 
+    def _fuel(self) -> dict[str, Any]:
+        """Return discovered fuel data."""
+        return discover_fuel(self.vehicle_status)
+
     @property
-    def native_value(self) -> int | None:
-        """Return the fuel level percentage."""
-        extra = self.vehicle_status.get("_xchanger_extra", {})
-        pct = extra.get("fuelLevelPct")
-        if pct is not None:
-            return int(pct)
+    def native_value(self) -> float | None:
+        """优先返回油量百分比，缺失时回退到油量容积（升）。"""
+        fuel = self._fuel()
+        if fuel["pct"] is not None:
+            return round(fuel["pct"])
+        if fuel["volume"] is not None:
+            return round(fuel["volume"], 1)
         return None
+
+    @property
+    def native_unit_of_measurement(self) -> str:
+        """油量百分比显示 %，回退到容积时显示 L。"""
+        fuel = self._fuel()
+        if fuel["pct"] is None and fuel["volume"] is not None:
+            return "L"
+        return PERCENTAGE
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return extra attributes including fuel liters."""
-        extra = self.vehicle_status.get("_xchanger_extra", {})
-        attrs = {}
-        fuel = extra.get("fuelLevel")
-        if fuel is not None:
-            attrs["fuel_liters"] = float(fuel)
+        fuel = self._fuel()
+        attrs: dict[str, Any] = {}
+        if fuel["pct"] is not None:
+            attrs["fuel_percent"] = round(fuel["pct"], 1)
+        if fuel["volume"] is not None:
+            attrs["fuel_liters"] = round(fuel["volume"], 1)
+        if fuel["range"] is not None:
+            attrs["fuel_range_km"] = round(fuel["range"])
+        if fuel["source"]:
+            attrs["source_field"] = fuel["source"]
         return attrs
 
 

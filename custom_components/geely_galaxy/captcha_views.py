@@ -252,6 +252,10 @@ def ensure_captcha_views(hass: HomeAssistant) -> None:
     逐个注册并容错：单个视图注册失败只记日志、不阻断流程；
     注册标记在所有视图都尝试过之后才置位，避免首次失败后
     被误判为已注册。
+
+    配置重载/集成重新加载时，旧视图类实例可能仍在路由表中，
+    此时再 register_view 会触发 "<DynamicResource ...> already has
+    OPTIONS handler" 错误——这里捕获后直接视为已注册即可。
     """
     domain_data = hass.data.setdefault(DOMAIN, {})
     if domain_data.get("captcha_view_registered"):
@@ -262,10 +266,28 @@ def ensure_captcha_views(hass: HomeAssistant) -> None:
         GeelyCaptchaCallbackView(),
         GeeTestProxyView(),
     ):
+        # 先检查是否已注册（避免重载时重复注册同一 URL）
+        already = False
+        try:
+            # aiohttp 的 app.router._resources 中可能已有同名 resource
+            for resource in hass.http.app.router.resources():
+                if getattr(resource, "canonical", None) == view.url:
+                    already = True
+                    break
+        except Exception:  # noqa: BLE001
+            already = False
+        if already:
+            _LOGGER.debug("视图 %s 已存在，跳过注册", view.url)
+            continue
         try:
             hass.http.register_view(view)
         except Exception as err:  # noqa: BLE001
-            _LOGGER.error("注册验证码视图 %s 失败: %s", view.url, err)
+            # 若为"already has handler"类错误，记录 debug 即可，不算失败
+            msg = str(err)
+            if "already has" in msg or "already registered" in msg.lower():
+                _LOGGER.debug("视图 %s 已存在于路由表: %s", view.url, err)
+            else:
+                _LOGGER.error("注册验证码视图 %s 失败: %s", view.url, err)
     domain_data["captcha_view_registered"] = True
 
 
