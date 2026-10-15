@@ -392,6 +392,17 @@ async def async_setup_entry(
             HomeChargerRecordsSensor(coordinator, entry, piling_code, charger_name),
         ])
 
+    # ========== 新增：车辆/车窗/天窗/遮阳帘状态 + 胎压传感器 ==========
+    entities.extend([
+        GeelyVehicleStateSensor(coordinator, entry),
+        GeelyWindowStatusSensor(coordinator, entry),
+        GeelySunroofStatusSensor(coordinator, entry),
+        GeelySunshadeStatusSensor(coordinator, entry),
+        GeelyTirePressureFL(coordinator, entry),
+        GeelyTirePressureFR(coordinator, entry),
+        GeelyTirePressureRL(coordinator, entry),
+        GeelyTirePressureRR(coordinator, entry),
+    ])
     async_add_entities(entities)
 
 
@@ -1790,3 +1801,540 @@ class HomeChargerRecordsSensor(HomeChargerBaseSensor):
             "total_records": records_total,
             "records": formatted_records,
         }
+
+
+# ============================================================================
+# 新增：车辆状态、车窗/天窗/遮阳帘状态、胎压传感器
+# ============================================================================
+
+def _find_value_recursive(data: Any, key_names: tuple[str, ...], case_insensitive: bool = True) -> Any:
+    """递归查找字段，支持多候选名"""
+    if data is None:
+        return None
+    if isinstance(data, dict):
+        for k, v in data.items():
+            k_str = str(k)
+            k_cmp = k_str.lower() if case_insensitive else k_str
+            for target in key_names:
+                t_cmp = target.lower() if case_insensitive else target
+                if k_cmp == t_cmp:
+                    if v is not None:
+                        return v
+            # 递归子节点
+            res = _find_value_recursive(v, key_names, case_insensitive)
+            if res is not None:
+                return res
+    elif isinstance(data, (list, tuple)):
+        for item in data:
+            res = _find_value_recursive(item, key_names, case_insensitive)
+            if res is not None:
+                return res
+    return None
+
+
+def _safe_float(val: Any) -> float | None:
+    """安全转浮点数，兼容字符串带引号"""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        s = val.strip().strip('"').strip("'")
+        if not s:
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    return None
+
+
+def _safe_int(val: Any) -> int | None:
+    f = _safe_float(val)
+    if f is None:
+        return None
+    return int(round(f))
+
+
+def _get_status_value(data: Any, key_names: tuple[str, ...]) -> str | None:
+    """获取状态值并转字符串（用于判断1/2/3）"""
+    val = _find_value_recursive(data, key_names)
+    if val is None:
+        return None
+    return str(val).strip()
+
+
+class GeelyVehicleStateSensor(CoordinatorEntity, SensorEntity):
+    """车辆状态：已熄火/驻车/空挡/行驶中"""
+
+    _attr_icon = "mdi:car-electric"
+    _attr_name = "车辆状态"
+
+    def __init__(self, coordinator: DataUpdateCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_vehicle_state"
+        try:
+            self._device_name = coordinator.data.get("device_name", "吉利银河") if coordinator.data else "吉利银河"
+            self._vin = coordinator.data.get("vin", "") if coordinator.data else ""
+        except Exception:
+            self._device_name = "吉利银河"
+            self._vin = ""
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, self._vin or self.unique_id)},
+            "name": self._device_name,
+            "manufacturer": "吉利银河",
+        }
+
+    @property
+    def native_value(self) -> str:
+        data = self.coordinator.data if self.coordinator.data else {}
+        vehicle_status = data.get("vehicle_status", {})
+
+        ign = _get_status_value(vehicle_status, ("ignitionOn", "engineOn", "engineStatus", "ignitionStatus", "powerStatus"))
+        gear = _get_status_value(vehicle_status, ("gearValue", "gearPosition", "gear", "currentGear", "shiftPosition"))
+        speed = _safe_float(_find_value_recursive(vehicle_status, ("speed", "vehicleSpeed", "currentSpeed", "drivingSpeed")))
+        if speed is None:
+            speed = _safe_float(_find_value_recursive(data, ("speed", "vehicleSpeed")))
+        epb = _get_status_value(vehicle_status, ("epbStatus", "parkBrakeStatus", "handbrakeStatus", "handBrakeStatus"))
+
+        attrs = {}
+        if speed is not None:
+            attrs["车速(km/h)"] = round(speed, 1)
+        if gear is not None:
+            attrs["挡位"] = gear
+        if ign is not None:
+            attrs["点火状态"] = ign
+        if epb is not None:
+            attrs["手刹"] = epb
+        self._attrs = attrs
+
+        is_ignition_on = ign in ("1", "ON", "on", "true", "True", True, 1, "start", "START")
+        is_moving = speed is not None and speed > 1.0
+
+        if not is_ignition_on:
+            return "已熄火"
+        if is_moving:
+            return "行驶中"
+        if gear in ("P", "p", "PARK", "park", "1", 1):
+            return "驻车(P挡)"
+        if gear in ("N", "n", "NEUTRAL", "neutral", "3", 3):
+            return "空挡(N挡)"
+        return "已挂挡"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        _ = self.native_value
+        return getattr(self, "_attrs", {})
+
+
+class GeelyWindowStatusSensor(CoordinatorEntity, SensorEntity):
+    """车窗状态：全关/微开/全开/部分打开，四窗独立状态"""
+
+    _attr_icon = "mdi:car-window"
+    _attr_name = "车窗状态"
+
+    WINDOW_POSITIONS = [
+        ("主驾车窗", ("driverWindowStatus", "windowStatusDriver", "driverWindow", "frontLeftWindow", "flWindow", "leftFrontWindowStatus", "windowStatus1")),
+        ("副驾车窗", ("passengerWindowStatus", "windowStatusPassenger", "passengerWindow", "frontRightWindow", "frWindow", "rightFrontWindowStatus", "windowStatus2")),
+        ("左后车窗", ("rearLeftWindowStatus", "windowStatusRearLeft", "rearLeftWindow", "rlWindow", "leftRearWindowStatus", "windowStatus3")),
+        ("右后车窗", ("windowStatusRearRight", "rearRightWindowStatus", "rearRightWindow", "rrWindow", "rightRearWindowStatus", "windowStatus4")),
+    ]
+
+    STATUS_MAP = {
+        "1": "全开", "open": "全开", "OPEN": "全开", "opened": "全开",
+        "2": "全关", "close": "全关", "CLOSE": "全关", "closed": "全关", "0": "全关",
+        "3": "微开", "ajar": "微开", "partial": "微开", "half": "微开",
+    }
+
+    def __init__(self, coordinator: DataUpdateCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_window_status"
+        try:
+            self._device_name = coordinator.data.get("device_name", "吉利银河") if coordinator.data else "吉利银河"
+            self._vin = coordinator.data.get("vin", "") if coordinator.data else ""
+        except Exception:
+            self._device_name = "吉利银河"
+            self._vin = ""
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, self._vin or self.unique_id)},
+            "name": self._device_name,
+            "manufacturer": "吉利银河",
+        }
+
+    def _get_window_state(self, data: Any, keys: tuple[str, ...]) -> str:
+        val = _get_status_value(data, keys)
+        if val is None:
+            return "未知"
+        return self.STATUS_MAP.get(val, f"未知({val})")
+
+    @property
+    def native_value(self) -> str:
+        data = self.coordinator.data if self.coordinator.data else {}
+        vehicle_status = data.get("vehicle_status", {})
+        per_window = {}
+        opened_count = 0
+        ajar_count = 0
+        unknown_count = 0
+        total = 0
+        for wname, wkeys in self.WINDOW_POSITIONS:
+            state = self._get_window_state(vehicle_status, wkeys)
+            per_window[wname] = state
+            total += 1
+            if state == "全开":
+                opened_count += 1
+            elif state == "微开":
+                ajar_count += 1
+            elif state.startswith("未知"):
+                unknown_count += 1
+        self._attrs = per_window
+        if opened_count == 0 and ajar_count == 0 and unknown_count == total:
+            return "未知"
+        if opened_count == total:
+            return "全开"
+        if opened_count == 0 and ajar_count == 0:
+            return "全关"
+        if opened_count == 0 and ajar_count == total:
+            return "微开"
+        return "部分打开"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        _ = self.native_value
+        return getattr(self, "_attrs", {})
+
+
+class GeelySunroofStatusSensor(CoordinatorEntity, SensorEntity):
+    """天窗状态：全关/微开/全开"""
+
+    _attr_icon = "mdi:car-select"
+    _attr_name = "天窗状态"
+    STATUS_MAP = {
+        "1": "全开", "open": "全开", "OPEN": "全开", "opened": "全开",
+        "2": "全关", "close": "全关", "CLOSE": "全关", "closed": "全关", "0": "全关",
+        "3": "微开", "ajar": "微开", "partial": "微开", "tilt": "微开",
+    }
+
+    def __init__(self, coordinator: DataUpdateCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_sunroof_status"
+        try:
+            self._device_name = coordinator.data.get("device_name", "吉利银河") if coordinator.data else "吉利银河"
+            self._vin = coordinator.data.get("vin", "") if coordinator.data else ""
+        except Exception:
+            self._device_name = "吉利银河"
+            self._vin = ""
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, self._vin or self.unique_id)},
+            "name": self._device_name,
+            "manufacturer": "吉利银河",
+        }
+
+    @property
+    def native_value(self) -> str:
+        data = self.coordinator.data if self.coordinator.data else {}
+        vs = data.get("vehicle_status", {})
+        val = _get_status_value(vs, ("sunroofStatus", "skylightStatus", "roofStatus", "sunroofOpenStatus", "skylightOpenStatus"))
+        if val is None:
+            return "未知"
+        return self.STATUS_MAP.get(val, f"未知({val})")
+
+
+class GeelySunshadeStatusSensor(CoordinatorEntity, SensorEntity):
+    """遮阳帘状态：全关/半开/全开"""
+
+    _attr_icon = "mdi:blinds"
+    _attr_name = "遮阳帘状态"
+    STATUS_MAP = {
+        "1": "全开", "open": "全开", "OPEN": "全开", "opened": "全开", "fullopen": "全开",
+        "2": "全关", "close": "全关", "CLOSE": "全关", "closed": "全关", "0": "全关",
+        "3": "半开", "half": "半开", "ajar": "半开", "partial": "半开", "middle": "半开",
+    }
+
+    def __init__(self, coordinator: DataUpdateCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_sunshade_status"
+        try:
+            self._device_name = coordinator.data.get("device_name", "吉利银河") if coordinator.data else "吉利银河"
+            self._vin = coordinator.data.get("vin", "") if coordinator.data else ""
+        except Exception:
+            self._device_name = "吉利银河"
+            self._vin = ""
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, self._vin or self.unique_id)},
+            "name": self._device_name,
+            "manufacturer": "吉利银河",
+        }
+
+    @property
+    def native_value(self) -> str:
+        data = self.coordinator.data if self.coordinator.data else {}
+        vs = data.get("vehicle_status", {})
+        val = _get_status_value(vs, (
+            "sunshadeStatus", "curtainStatus", "skylightCurtainStatus",
+            "sunCurtainStatus", "sunroofCurtainStatus", "shadeStatus",
+        ))
+        if val is None:
+            return "未知"
+        return self.STATUS_MAP.get(val, f"未知({val})")
+
+
+# ---- 胎压（智能单位转换 + 模糊匹配兜底）----
+# 银河 A7（VC 通道）实测字段命名规则（位于 vehicleTyreStatus 节点下）：
+#   driver = 左，passenger = 右；不带 Rear = 前轮，带 Rear = 后轮
+#     vehicleTyreStatus.tyreStatusDriver        -> 左前
+#     vehicleTyreStatus.tyreStatusPassenger     -> 右前
+#     vehicleTyreStatus.tyreStatusDriverRear    -> 左后
+#     vehicleTyreStatus.tyreStatusPassengerRear -> 右后
+# 单位已是 kPa（如 270.481 ≈ 2.70 bar），无需换算。
+_TIRE_PRESSURE_FIELDS = {
+    "左前胎压": (
+        "tyreStatusDriver", "tireStatusDriver",
+        "frontLeftTirePressure", "leftFrontTirePressure", "tirePressureFrontLeft",
+        "tirePressureLeftFront", "flTirePressure", "flPressure", "tirePressureFl",
+        "frontLeftTpms", "tpmsFrontLeft", "tyrePressureFrontLeft",
+        "tyrePressureLeftFront",
+    ),
+    "右前胎压": (
+        "tyreStatusPassenger", "tireStatusPassenger",
+        "frontRightTirePressure", "rightFrontTirePressure", "tirePressureFrontRight",
+        "tirePressureRightFront", "frTirePressure", "frPressure", "tirePressureFr",
+        "frontRightTpms", "tpmsFrontRight", "tyrePressureFrontRight",
+        "tyrePressureRightFront",
+    ),
+    "左后胎压": (
+        "tyreStatusDriverRear", "tireStatusDriverRear",
+        "rearLeftTirePressure", "leftRearTirePressure", "tirePressureRearLeft",
+        "tirePressureLeftRear", "rlTirePressure", "rlPressure", "tirePressureRl",
+        "rearLeftTpms", "tpmsRearLeft", "tyrePressureRearLeft",
+        "tyrePressureLeftRear",
+    ),
+    "右后胎压": (
+        "tyreStatusPassengerRear", "tireStatusPassengerRear",
+        "rearRightTirePressure", "rightRearTirePressure", "tirePressureRearRight",
+        "tirePressureRightRear", "rrTirePressure", "rrPressure", "tirePressureRr",
+        "rearRightTpms", "tpmsRearRight", "tyrePressureRearRight",
+        "tyrePressureRightRear",
+    ),
+}
+
+# 轮胎温度字段（同上命名规则，单位 ℃）
+_TIRE_TEMP_FIELDS = {
+    "左前胎压": ("tyreTempDriver", "tireTempDriver", "tyreTemperatureDriver"),
+    "右前胎压": ("tyreTempPassenger", "tireTempPassenger", "tyreTemperaturePassenger"),
+    "左后胎压": ("tyreTempDriverRear", "tireTempDriverRear", "tyreTemperatureDriverRear"),
+    "右后胎压": (
+        "tyreTempPassengerRear", "tireTempPassengerRear", "tyreTemperaturePassengerRear",
+    ),
+}
+
+
+def _collect_tire_fields(data: Any) -> dict[str, dict[str, Any]]:
+    """兜底：全树收集所有tire/tyre/tpms字段"""
+    found = {}
+
+    def _walk(obj: Any, path: str = ""):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                k_lower = str(k).lower()
+                new_path = f"{path}.{k}" if path else str(k)
+                if any(kw in k_lower for kw in ("tire", "tyre", "tpms")) and v is not None:
+                    try:
+                        fv = float(v)
+                        found[new_path] = fv
+                    except (ValueError, TypeError):
+                        pass
+                _walk(v, new_path)
+        elif isinstance(obj, (list, tuple)):
+            for i, item in enumerate(obj):
+                _walk(item, f"{path}[{i}]")
+    _walk(data)
+    return found
+
+
+# 模糊匹配关键词： (必须命中其一, 必须排除) —— 仅在精确字段名都没命中时兜底
+# 注意 driver=左 / passenger=右，且 "tyreStatusDriver" 是
+# "tyreStatusDriverRear" 的前缀，所以前轮必须排除含 rear 的路径。
+_POSITION_KEYWORDS = {
+    "左前胎压": (
+        ("tyrestatusdriver", "tirestatusdriver", "frontleft", "leftfront", "fl"),
+        ("rear", "back"),
+    ),
+    "右前胎压": (
+        ("tyrestatuspassenger", "tirestatuspassenger", "frontright", "rightfront", "fr"),
+        ("rear", "back"),
+    ),
+    "左后胎压": (
+        ("tyrestatusdriverrear", "tirestatusdriverrear", "rearleft", "leftrear", "rl"),
+        (),
+    ),
+    "右后胎压": (
+        (
+            "tyrestatuspassengerrear", "tirestatuspassengerrear",
+            "rearright", "rightrear", "rr",
+        ),
+        (),
+    ),
+}
+
+
+def _normalize_tire_kpa(raw_val: float) -> float | None:
+    """把各种单位的胎压值转换成kPa"""
+    if raw_val is None:
+        return None
+    try:
+        v = float(raw_val)
+    except (ValueError, TypeError):
+        return None
+    if v <= 0:
+        return None
+    # bar * 100 = kPa
+    if v < 10:
+        return round(v * 100, 1)
+    # bar*10 存储（如2.5bar=25）
+    if v < 100:
+        return round(v * 10, 1)
+    # 已经是kPa
+    if 100 <= v <= 600:
+        return round(v, 1)
+    return None
+
+
+class GeelyTirePressureSensorNew(CoordinatorEntity, SensorEntity):
+    """胎压传感器基类"""
+    _attr_native_unit_of_measurement = "kPa"
+    _attr_device_class = SensorDeviceClass.PRESSURE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:tire"
+
+    def __init__(self, coordinator: DataUpdateCoordinator, entry: ConfigEntry,
+                 position: str, keys: tuple[str, ...]) -> None:
+        super().__init__(coordinator)
+        self._position = position
+        self._keys = keys
+        self._attr_name = position
+        self._attr_unique_id = f"{entry.entry_id}_tire_{position}"
+        try:
+            self._device_name = coordinator.data.get("device_name", "吉利银河") if coordinator.data else "吉利银河"
+            self._vin = coordinator.data.get("vin", "") if coordinator.data else ""
+        except Exception:
+            self._device_name = "吉利银河"
+            self._vin = ""
+        self._raw_field = None
+        self._raw_value = None
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, self._vin or self.unique_id)},
+            "name": self._device_name,
+            "manufacturer": "吉利银河",
+        }
+
+    def _containers(self) -> list[Any]:
+        """按优先级返回待搜索的数据容器"""
+        data = self.coordinator.data if self.coordinator.data else {}
+        out: list[Any] = []
+        vs = data.get("vehicle_status") if isinstance(data, dict) else None
+        if isinstance(vs, dict):
+            out.append(vs)
+        out.append(data)
+        return out
+
+    def _find_tire_value(self) -> tuple[float | None, str | None, float | None]:
+        # 1. 精确字段名查找（A7 走这一步：tyreStatusDriver / Passenger / *Rear）
+        for container in self._containers():
+            for k in self._keys:
+                v = _find_value_recursive(container, (k,))
+                if v is None:
+                    continue
+                fv = _safe_float(v)
+                if fv is None:
+                    continue
+                kpa = _normalize_tire_kpa(fv)
+                if kpa is not None:
+                    return kpa, k, fv
+
+        # 2. 兜底：全树收集 tire/tyre/tpms 字段后按位置关键词匹配
+        include_kws, exclude_kws = _POSITION_KEYWORDS.get(self._position, ((), ()))
+        for container in self._containers():
+            all_fields = _collect_tire_fields(container)
+            for path, val in all_fields.items():
+                path_lower = path.lower()
+                # 温度/预警字段不是胎压，排除，避免误判（如温度30被当成300kPa）
+                if any(kw in path_lower for kw in ("temp", "warn", "pre")):
+                    continue
+                if any(kw in path_lower for kw in exclude_kws):
+                    continue
+                if include_kws and not any(kw in path_lower for kw in include_kws):
+                    continue
+                kpa = _normalize_tire_kpa(val)
+                if kpa is not None:
+                    return kpa, path, val
+        return None, None, None
+
+    def _find_tire_temp(self) -> float | None:
+        """查找该轮位的轮胎温度（℃）"""
+        for container in self._containers():
+            for k in _TIRE_TEMP_FIELDS.get(self._position, ()):
+                fv = _safe_float(_find_value_recursive(container, (k,)))
+                if fv is not None and -50 <= fv <= 150:
+                    return round(fv, 1)
+        return None
+
+    @property
+    def native_value(self) -> float | None:
+        kpa, field, raw = self._find_tire_value()
+        self._raw_field = field
+        self._raw_value = raw
+        return kpa
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        attrs = {}
+        if self._raw_field:
+            attrs["命中字段"] = self._raw_field
+        if self._raw_value is not None:
+            attrs["原始值"] = self._raw_value
+        temp = self._find_tire_temp()
+        if temp is not None:
+            attrs["轮胎温度"] = temp
+        # 仅左前胎压输出所有胎压字段，方便诊断
+        if self._position == "左前胎压":
+            for container in self._containers():
+                all_tpms = _collect_tire_fields(container)
+                if all_tpms:
+                    attrs["全部胎压字段"] = dict(all_tpms)
+                    break
+        return attrs
+
+
+class GeelyTirePressureFL(GeelyTirePressureSensorNew):
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator, entry, "左前胎压", _TIRE_PRESSURE_FIELDS["左前胎压"])
+
+
+class GeelyTirePressureFR(GeelyTirePressureSensorNew):
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator, entry, "右前胎压", _TIRE_PRESSURE_FIELDS["右前胎压"])
+
+
+class GeelyTirePressureRL(GeelyTirePressureSensorNew):
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator, entry, "左后胎压", _TIRE_PRESSURE_FIELDS["左后胎压"])
+
+
+class GeelyTirePressureRR(GeelyTirePressureSensorNew):
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator, entry, "右后胎压", _TIRE_PRESSURE_FIELDS["右后胎压"])
