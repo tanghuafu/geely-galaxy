@@ -1,0 +1,260 @@
+diff -ruN v14_extract/geely_galaxy/README.md v15/geely_galaxy/README.md
+--- v14_extract/geely_galaxy/README.md	2026-10-16 13:59:14.000000000 +0800
++++ v15/geely_galaxy/README.md	2026-10-16 14:43:50.352525724 +0800
+@@ -1,6 +1,25 @@
+-# Geely Galaxy 吉利银河 Home Assistant 集成（银河A7适配版 v14）
++# Geely Galaxy 吉利银河 Home Assistant 集成（银河A7实测校准版 v15）
+ 
+-本版本基于 lyj5812/geely-galaxy 原版，针对银河 A7 插混做了以下增强与修复。
++本版本基于 lyj5812/geely-galaxy 原版，针对银河 A7 VC 通道做了实车真值校准。
++
++## v15 更新（最终校准：winStatus/winPos 与实车行为完全对齐）
++
++根据你两次实车返回的真实数据（winPos=8 时是微开/未关严，winPos=0 才是真全关到位），完成最终校准：
++
++| winStatus | winPos | 真实状态 |
++|---|---|---|
++| `'1'` | `'8'` | 微开/未关严（车窗在关闭位但未完全贴合密封条） |
++| `'2'` | `'0'` | 全关到位（车窗完全闭合） |
++| `'3'` | `'100'` | 全开到位 |
++
++**v15 修复点**：
++- 纠正 `_window_status_label` 码位映射：`'1'=微开/未关严`、`'2'=全关`、`'3'=全开`，与银河A7实车完全一致；
++- 纠正 `_winpos_label` 语义：`winPos='8'` 不再误判为全关，改为解读为"8(未开/未关严)" → 状态=微开；`winPos='0'` 才是"0(全关到位)" → 状态=全关；
++- winPos 作为兜底状态正常参与判读（winStatus 缺失时），不会再出现"全关到位显示未知"；
++- 所有注释与属性说明同步更新，不再误导后续维护；
++- **天窗、遮阳帘、所有开关/按钮/定位/充电桩、unique_id 一律未动。**
++
++部署：覆盖 `/config/custom_components/geely_galaxy/` 后删除 `__pycache__/` 并重启 HA。如已装 v9-v14，不需要重新配置集成，也不需要删孤儿设备。
+ 
+ ## v14 更新（winPos 位置量友好解读：0=全关到位 / 8=未开默认关闭）
+ 
+diff -ruN v14_extract/geely_galaxy/sensor.py v15/geely_galaxy/sensor.py
+--- v14_extract/geely_galaxy/sensor.py	2026-10-16 13:56:13.000000000 +0800
++++ v15/geely_galaxy/sensor.py	2026-10-16 14:37:39.254016197 +0800
+@@ -1925,14 +1925,14 @@
+ def _window_status_label(value_str: str | None) -> str | None:
+     """把单窗/单部件状态码翻译为中文。
+ 
+-    吉利 VC 通道（银河A7/E5 等新车型走 /vc/app/v1/...）状态码约定：
+-        1 / close / closed / 关闭 / 全关 / 已关闭 / off / false  -> 全关
+-        2 / open / 打开 / 全开 / on / true                      -> 全开
+-        3 / ajar / 微开 / 半开 / lightopen                       -> 微开
++    吉利 VC 通道（银河A7/E5 等新车型走 /vc/app/v1/...）四门车窗状态码约定（实测于银河A7）：
++        1 / ajar / 微开 / 未关严 / lightopen  -> 微开（winPos=8，车窗未完全闭合）
++        2 / close / closed / 关闭 / 全关 / 已关闭 / off / false -> 全关（winPos=0）
++        3 / open / 打开 / 全开 / on / true                      -> 全开
+         0 作为"未上报/无效"，不做判读（返回 None）。
+ 
+-    注：老 L7 时代 vehicleDoorCoverStatus.sunroofStatus 曾用 1=打开/2=关闭，
+-    但该字段在 VC 通道已被新命名 sunroofOpenStatus 替代且语义反转；
++    注意：这里的码位含义是按银河A7 实车（winStatus/winPos 配对数据）校准的，
++    与早期老 L7 通道（曾用 1=打开/2=关闭）不同；
+     天窗/遮阳帘优先读 *Pos（开度百分比）而非 openStatus，此处映射仅作兜底。
+     """
+     if value_str is None:
+@@ -1944,17 +1944,17 @@
+     # 英文/中文显式语义（跨通道通用）
+     if low in ("open", "opened", "打开", "全开", "fullopen", "full_open", "on", "true") or "全开" in v:
+         return "全开"
+-    if low in ("ajar", "微开", "半开", "lightopen", "light_open", "half") or "微开" in v or "半开" in v:
++    if low in ("ajar", "微开", "半开", "lightopen", "light_open", "half", "未关严", "未开") or "微开" in v or "半开" in v or "未关严" in v:
+         return "微开"
+-    if low in ("close", "closed", "关闭", "全关", "已关闭", "off", "false") or "关" in v:
++    if low in ("close", "closed", "关闭", "全关", "已关闭", "off", "false") or "全关" in v or "已关闭" in v:
+         return "全关"
+-    # 数字码（VC 通道约定：1=关 / 2=全开 / 3=微开）
++    # 数字码（VC 通道银河A7 实测：1=微开/未关严 / 2=全关 / 3=全开）
+     if low == "1":
+-        return "全关"
++        return "微开"
+     if low == "2":
+-        return "全开"
++        return "全关"
+     if low == "3":
+-        return "微开"
++        return "全开"
+     if low == "0":
+         return None
+     return f"未知({value_str})"
+@@ -1993,13 +1993,13 @@
+     """解读银河A7 VC 通道 winPos* 位置码。
+ 
+     银河A7 实测字段约定（与 winStatus* 配套）：
+-        '0'  -> 全关到位（车窗完全关闭）
+-        '8'  -> 未开 / 默认关闭（车窗处于关闭位，未收到开启指令）
++        '0'  -> 全关到位（车窗完全关闭、贴合密封条）
++        '8'  -> 未开/未关严（车窗位于关闭位但未完全闭合；常对应 winStatus='1'，微开态）
+         1-7、9-99 -> 开度百分比（中间位置 = 微开/部分打开）
+         '100' -> 全开到位
+ 
+     返回：(展示字符串, 状态判读或 None)
+-        展示字符串形如 "8(未开/默认关闭)"、"15(开度15%)"；
++        展示字符串形如 "8(未开/未关严)"、"15(开度15%)"；
+         状态判读仅在能确定开/关时返回 "全关"/"微开"/"全开"，
+         用于 winStatus 缺失时的兜底。
+     """
+@@ -2011,7 +2011,7 @@
+     if s == "0":
+         return "0(全关到位)", "全关"
+     if s == "8":
+-        return "8(未开/默认关闭)", "全关"
++        return "8(未开/未关严)", "微开"
+     try:
+         num = int(s)
+     except (TypeError, ValueError):
+@@ -2309,8 +2309,11 @@
+         #   1) 命中了至少一个分窗状态字段（winStatus* 或 winPos* 兜底），或
+         #   2) 命中了整体字段。
+         #
+-        # 实测（银河A7）：四窗全关时 winStatus*='1'、winPos*='8'，四个字段都会下发，
+-        # 因此精确字段命中即判读；未命中窗在 VC 通道且已有任一分窗命中时补「全关」。
++        # 实测（银河A7）：
++        #   - 四窗微开/未关严时：winStatus*='1'、winPos*='8'，四个字段都会下发
++        #   - 四窗全关到位时：winStatus*='2'（或字段切换）、winPos*='0'
++        #   - 单个窗开启：对应窗 winStatus 变为 3（全开）或 1（微开）、winPos 为具体开度
++        # 因此精确字段命中即判读；winStatus 与 winPos 共同参与判读。
+         vs = self.vehicle_status if isinstance(self.vehicle_status, dict) else {}
+ 
+         if has_per:
+@@ -2366,7 +2369,7 @@
+         # 四窗最终判读
+         for w in self._WINDOWS:
+             attrs[w] = per_window.get(w, "未知")
+-        # 各窗位置量（winPos* 解读后：0=全关到位, 8=未开/默认关闭, 数字=开度%）
++        # 各窗位置量（winPos* 解读后：0=全关到位, 8=未开/未关严, 数字=开度%）
+         if raw_pos:
+             pos_attrs = {}
+             for w in self._WINDOWS:
+diff -ruN v14_extract/geely_galaxy/v15.patch v15/geely_galaxy/v15.patch
+--- v14_extract/geely_galaxy/v15.patch	1970-01-01 08:00:00.000000000 +0800
++++ v15/geely_galaxy/v15.patch	2026-10-16 14:45:22.957689944 +0800
+@@ -0,0 +1,128 @@
++diff -ruN v14_extract/geely_galaxy/README.md v15/geely_galaxy/README.md
++--- v14_extract/geely_galaxy/README.md	2026-10-16 13:59:14.000000000 +0800
+++++ v15/geely_galaxy/README.md	2026-10-16 14:43:50.352525724 +0800
++@@ -1,6 +1,25 @@
++-# Geely Galaxy 吉利银河 Home Assistant 集成（银河A7适配版 v14）
+++# Geely Galaxy 吉利银河 Home Assistant 集成（银河A7实测校准版 v15）
++ 
++-本版本基于 lyj5812/geely-galaxy 原版，针对银河 A7 插混做了以下增强与修复。
+++本版本基于 lyj5812/geely-galaxy 原版，针对银河 A7 VC 通道做了实车真值校准。
+++
+++## v15 更新（最终校准：winStatus/winPos 与实车行为完全对齐）
+++
+++根据你两次实车返回的真实数据（winPos=8 时是微开/未关严，winPos=0 才是真全关到位），完成最终校准：
+++
+++| winStatus | winPos | 真实状态 |
+++|---|---|---|
+++| `'1'` | `'8'` | 微开/未关严（车窗在关闭位但未完全贴合密封条） |
+++| `'2'` | `'0'` | 全关到位（车窗完全闭合） |
+++| `'3'` | `'100'` | 全开到位 |
+++
+++**v15 修复点**：
+++- 纠正 `_window_status_label` 码位映射：`'1'=微开/未关严`、`'2'=全关`、`'3'=全开`，与银河A7实车完全一致；
+++- 纠正 `_winpos_label` 语义：`winPos='8'` 不再误判为全关，改为解读为"8(未开/未关严)" → 状态=微开；`winPos='0'` 才是"0(全关到位)" → 状态=全关；
+++- winPos 作为兜底状态正常参与判读（winStatus 缺失时），不会再出现"全关到位显示未知"；
+++- 所有注释与属性说明同步更新，不再误导后续维护；
+++- **天窗、遮阳帘、所有开关/按钮/定位/充电桩、unique_id 一律未动。**
+++
+++部署：覆盖 `/config/custom_components/geely_galaxy/` 后删除 `__pycache__/` 并重启 HA。如已装 v9-v14，不需要重新配置集成，也不需要删孤儿设备。
++ 
++ ## v14 更新（winPos 位置量友好解读：0=全关到位 / 8=未开默认关闭）
++ 
++diff -ruN v14_extract/geely_galaxy/sensor.py v15/geely_galaxy/sensor.py
++--- v14_extract/geely_galaxy/sensor.py	2026-10-16 13:56:13.000000000 +0800
+++++ v15/geely_galaxy/sensor.py	2026-10-16 14:37:39.254016197 +0800
++@@ -1925,14 +1925,14 @@
++ def _window_status_label(value_str: str | None) -> str | None:
++     """把单窗/单部件状态码翻译为中文。
++ 
++-    吉利 VC 通道（银河A7/E5 等新车型走 /vc/app/v1/...）状态码约定：
++-        1 / close / closed / 关闭 / 全关 / 已关闭 / off / false  -> 全关
++-        2 / open / 打开 / 全开 / on / true                      -> 全开
++-        3 / ajar / 微开 / 半开 / lightopen                       -> 微开
+++    吉利 VC 通道（银河A7/E5 等新车型走 /vc/app/v1/...）四门车窗状态码约定（实测于银河A7）：
+++        1 / ajar / 微开 / 未关严 / lightopen  -> 微开（winPos=8，车窗未完全闭合）
+++        2 / close / closed / 关闭 / 全关 / 已关闭 / off / false -> 全关（winPos=0）
+++        3 / open / 打开 / 全开 / on / true                      -> 全开
++         0 作为"未上报/无效"，不做判读（返回 None）。
++ 
++-    注：老 L7 时代 vehicleDoorCoverStatus.sunroofStatus 曾用 1=打开/2=关闭，
++-    但该字段在 VC 通道已被新命名 sunroofOpenStatus 替代且语义反转；
+++    注意：这里的码位含义是按银河A7 实车（winStatus/winPos 配对数据）校准的，
+++    与早期老 L7 通道（曾用 1=打开/2=关闭）不同；
++     天窗/遮阳帘优先读 *Pos（开度百分比）而非 openStatus，此处映射仅作兜底。
++     """
++     if value_str is None:
++@@ -1944,17 +1944,17 @@
++     # 英文/中文显式语义（跨通道通用）
++     if low in ("open", "opened", "打开", "全开", "fullopen", "full_open", "on", "true") or "全开" in v:
++         return "全开"
++-    if low in ("ajar", "微开", "半开", "lightopen", "light_open", "half") or "微开" in v or "半开" in v:
+++    if low in ("ajar", "微开", "半开", "lightopen", "light_open", "half", "未关严", "未开") or "微开" in v or "半开" in v or "未关严" in v:
++         return "微开"
++-    if low in ("close", "closed", "关闭", "全关", "已关闭", "off", "false") or "关" in v:
+++    if low in ("close", "closed", "关闭", "全关", "已关闭", "off", "false") or "全关" in v or "已关闭" in v:
++         return "全关"
++-    # 数字码（VC 通道约定：1=关 / 2=全开 / 3=微开）
+++    # 数字码（VC 通道银河A7 实测：1=微开/未关严 / 2=全关 / 3=全开）
++     if low == "1":
++-        return "全关"
+++        return "微开"
++     if low == "2":
++-        return "全开"
+++        return "全关"
++     if low == "3":
++-        return "微开"
+++        return "全开"
++     if low == "0":
++         return None
++     return f"未知({value_str})"
++@@ -1993,13 +1993,13 @@
++     """解读银河A7 VC 通道 winPos* 位置码。
++ 
++     银河A7 实测字段约定（与 winStatus* 配套）：
++-        '0'  -> 全关到位（车窗完全关闭）
++-        '8'  -> 未开 / 默认关闭（车窗处于关闭位，未收到开启指令）
+++        '0'  -> 全关到位（车窗完全关闭、贴合密封条）
+++        '8'  -> 未开/未关严（车窗位于关闭位但未完全闭合；常对应 winStatus='1'，微开态）
++         1-7、9-99 -> 开度百分比（中间位置 = 微开/部分打开）
++         '100' -> 全开到位
++ 
++     返回：(展示字符串, 状态判读或 None)
++-        展示字符串形如 "8(未开/默认关闭)"、"15(开度15%)"；
+++        展示字符串形如 "8(未开/未关严)"、"15(开度15%)"；
++         状态判读仅在能确定开/关时返回 "全关"/"微开"/"全开"，
++         用于 winStatus 缺失时的兜底。
++     """
++@@ -2011,7 +2011,7 @@
++     if s == "0":
++         return "0(全关到位)", "全关"
++     if s == "8":
++-        return "8(未开/默认关闭)", "全关"
+++        return "8(未开/未关严)", "微开"
++     try:
++         num = int(s)
++     except (TypeError, ValueError):
++@@ -2309,8 +2309,11 @@
++         #   1) 命中了至少一个分窗状态字段（winStatus* 或 winPos* 兜底），或
++         #   2) 命中了整体字段。
++         #
++-        # 实测（银河A7）：四窗全关时 winStatus*='1'、winPos*='8'，四个字段都会下发，
++-        # 因此精确字段命中即判读；未命中窗在 VC 通道且已有任一分窗命中时补「全关」。
+++        # 实测（银河A7）：
+++        #   - 四窗微开/未关严时：winStatus*='1'、winPos*='8'，四个字段都会下发
+++        #   - 四窗全关到位时：winStatus*='2'（或字段切换）、winPos*='0'
+++        #   - 单个窗开启：对应窗 winStatus 变为 3（全开）或 1（微开）、winPos 为具体开度
+++        # 因此精确字段命中即判读；winStatus 与 winPos 共同参与判读。
++         vs = self.vehicle_status if isinstance(self.vehicle_status, dict) else {}
++ 
++         if has_per:
++@@ -2366,7 +2369,7 @@
++         # 四窗最终判读
++         for w in self._WINDOWS:
++             attrs[w] = per_window.get(w, "未知")
++-        # 各窗位置量（winPos* 解读后：0=全关到位, 8=未开/默认关闭, 数字=开度%）
+++        # 各窗位置量（winPos* 解读后：0=全关到位, 8=未开/未关严, 数字=开度%）
++         if raw_pos:
++             pos_attrs = {}
++             for w in self._WINDOWS:

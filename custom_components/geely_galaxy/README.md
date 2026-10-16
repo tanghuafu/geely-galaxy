@@ -1,8 +1,178 @@
-# Geely Galaxy 吉利银河 Home Assistant 集成（银河A7适配版 v9）
+# Geely Galaxy 吉利银河 Home Assistant 集成（银河A7实测校准版 v16）
 
-本版本基于 lyj5812/geely-galaxy 原版，针对银河 A7 插混做了以下增强与修复。
+本版本基于 lyj5812/geely-galaxy 原版，针对银河 A7 VC 通道做了实车真值校准。
 
-## v9 更新（本次修复「实体散落到多个设备 + 天窗/车窗状态读数错误」）
+## v16 更新（修复：winPos=0 全关到位时四窗显示「未知」的 bug）
+
+**根因**：v15 里有两个代码级 bug 叠加，导致「winPos=0 全关到位、winStatus 不下发」时四窗都显示未知：
+1. 启发式递归扫描中，**分支顺序写反**了——先跑「分窗状态字段」匹配，再跑「winPos 位置字段」匹配。但 `winPosDriver / winPosPassenger` 这类字段名里本身就含 `driver/passenger` 方位关键字，会被前一个分支截走，把 `'0'` 送进状态判读（而状态判读里 `0` 是"未上报/无效"返回 None），continue 之后就永远走不到 winPos 分支。
+2. 精确匹配块里，命中 winPos 字段并解读出状态后，**没有把 `has_any_per_window` 置 True**（只有 winStatus 分支才会置），导致后续「对未命中窗用 raw_pos_state 补全全关」的逻辑根本不会跑。
+
+**v16 修复点**：
+- 启发式递归里**先判 winPos*/windowPos*（位置量），再判普通 status 字段**，彻底避免字段名关键字被截胡；
+- 精确匹配阶段命中 winPos 且能判读出状态时，**直接写入 result、并置 has_any_per_window=True**，确保补全逻辑生效；
+- 6 组典型场景（全关 winStatus 缺失 / 四窗微开 / 全关下发 winStatus=2 / 单窗全开 / 单窗微开不串位 / winPos 单独判开度）全部单元测试通过；
+- **天窗、遮阳帘、所有开关/按钮/定位/充电桩、unique_id 一律未动。**
+
+部署：覆盖 `/config/custom_components/geely_galaxy/` 后删除 `__pycache__/` 并重启 HA。已装 v9-v15 不需要重新配置集成，也不需要删孤儿设备。
+
+## v15 更新（最终校准：winStatus/winPos 与实车行为完全对齐）
+
+根据你两次实车返回的真实数据（winPos=8 时是微开/未关严，winPos=0 才是真全关到位），完成最终校准：
+
+| winStatus | winPos | 真实状态 |
+|---|---|---|
+| `'1'` | `'8'` | 微开/未关严（车窗在关闭位但未完全贴合密封条） |
+| `'2'` | `'0'` | 全关到位（车窗完全闭合） |
+| `'3'` | `'100'` | 全开到位 |
+
+**v15 修复点**：
+- 纠正 `_window_status_label` 码位映射：`'1'=微开/未关严`、`'2'=全关`、`'3'=全开`，与银河A7实车完全一致；
+- 纠正 `_winpos_label` 语义：`winPos='8'` 不再误判为全关，改为解读为"8(未开/未关严)" → 状态=微开；`winPos='0'` 才是"0(全关到位)" → 状态=全关；
+- winPos 作为兜底状态正常参与判读（winStatus 缺失时），不会再出现"全关到位显示未知"；
+- 所有注释与属性说明同步更新，不再误导后续维护；
+- **天窗、遮阳帘、所有开关/按钮/定位/充电桩、unique_id 一律未动。**
+
+部署：覆盖 `/config/custom_components/geely_galaxy/` 后删除 `__pycache__/` 并重启 HA。如已装 v9-v14，不需要重新配置集成，也不需要删孤儿设备。
+
+## v14 更新（winPos 位置量友好解读：0=全关到位 / 8=未开默认关闭）
+
+根据实车反馈，银河 A7 VC 通道的 `winPos*` 字段含义已经明确：
+
+| winPos 值 | 含义 | 状态判读 |
+|---|---|---|
+| `'0'` | 全关到位（车窗完全闭合） | 全关 |
+| `'8'` | 未开 / 默认关闭（车窗在关闭位，未收到开启指令） | 全关 |
+| 1–7、9–99 | 开度百分比（中间位置） | 微开/部分打开 |
+| `'100'` | 全开到位 | 全开 |
+
+你之前看到"位置量 raw 主驾:'8'"——这正是全关状态下的正常值。`'8'` 不是"开了 8%"，而是车端的"关闭/未开"枚举码；**全关时会有两种码（0 与 8）**，都属于关闭。
+
+**v14 修复点**：
+
+- 属性 `位置量_raw` 更名为 `位置量`，值从裸的原始值改为解读后的友好字符串，例如：
+  - 全关：`主驾: 8(未开/默认关闭)，副驾: 8(未开/默认关闭)，左后: 0(全关到位)，右后: 8(未开/默认关闭)`
+  - 开窗：`主驾: 15(开度15%)，副驾: 100(开度100%)`
+- winStatus* 仍是主判读依据，winPos 解读仅作为状态属性展示；但当 winStatus* 缺失时，会用 winPos 的判读结果兜底，避免出现"字段明明在但显示未知"的情况；
+- 整体状态判读（全关/微开/全开/部分打开）的合并规则不变，四窗最终状态依旧由 winStatus* 主导。
+- **天窗、遮阳帘、所有开关/按钮/定位/充电桩、以及 unique_id 一律未动。**
+
+部署：覆盖 `/config/custom_components/geely_galaxy/` 后删除 `__pycache__/` 并重启 HA。如已装 v9/v10/v11/v12/v13，**不需要**重新配置集成，也不需要删孤儿设备。
+
+## v13 更新（车窗状态最终修复：纠正 VC 通道状态码语义 + 分离位置量）
+
+拿到银河 A7 实车数据后，定位到前几版显示错误的**真正根因**：状态码语义搞反了。
+
+**实车数据（车停稳、四窗全关 + 天窗/遮阳帘全关时）**：
+
+```
+vehicleWindowStatus:
+  winPosDriver: '8'           winStatusDriver: '1'
+  winPosPassenger: '8'        winStatusPassenger: '1'
+  winPosDriverRear: '8'       winStatusDriverRear: '1'
+  winPosPassengerRear: '8'    winStatusPassengerRear: '1'
+  sunroofPos: '0'    sunroofOpenStatus: '1'
+  curtainPos: '0'    curtainOpenStatus: '1'
+```
+
+**根因分析**：
+
+1. **四门车窗在 VC 通道**（`/vc/app/v1/vehicle/control/status`）**关闭时字段是存在的**，不是"不下发"。四个窗的 `winStatus*` 字段全都会返回值（全关时是 `'1'`）；
+2. **状态码语义被搞反了**：VC 通道里 `1=关闭`、`2=全开`、`3=微开`。前几版沿用老 L7 时代的映射把 `'1'` 判成"全开"，所以四个窗全显示"全开"；
+3. **`winPos*` 是车端位置量**（实测值 `'8'`），**不是** 0-100 开度百分比，不能直接用百分比判"全开/全关/部分打开"，否则会被误判；
+4. 对照青龙 `jlyh.js`（同样走 `galaxy-vc.geely.com` 控制窗口）和 `Eternity-h/geely-galaxy`（星舰7分支），确认天窗/遮阳帘的 `sunroofPos/curtainPos` 是 0-100 开度百分比（这条之前判断正确），而四门车窗的 `winPos*` 与 `winStatus*` 是另一套编码。
+
+**v13 修复点**：
+
+- 状态码映射按 VC 通道语义重写：`1=全关`、`2=全开`、`3=微开`；英文/中文显式值（`open/close/ajar`、`打开/关闭/微开`）跨通道仍通用；
+- `winPos*` 从状态判读字段中移除，加入排除关键字，避免再把位置量当成状态；改为收集到属性 `位置量_raw` 中供你核对含义；
+- 四门车窗精确字段：`winStatusDriver / winStatusPassenger / winStatusDriverRear / winStatusPassengerRear`，四个字段都会命中；
+- 补全窗逻辑调整：只有"至少一个分窗字段命中"时才对未命中的窗做补全（套整体字段值），不再因 `vehicleWindowStatus` 块存在就强行补"全关"，避免误判；
+- 天窗/遮阳帘仍以 `sunroofPos/curtainPos` 开度为权威（这个判断从 v9 起就正确），`sunroofOpenStatus/curtainOpenStatus='1'` 的兜底判读同步按 VC 语义判"全关"；
+- v12 新增的「车辆原始数据」诊断传感器保留。
+- **天窗、遮阳帘、所有开关/按钮/定位/充电桩 一律未动。**
+
+部署：覆盖 `/config/custom_components/geely_galaxy/` 后删除 `__pycache__/` 并重启 HA。如已装 v9/v10/v11/v12，**不需要**重新配置集成，也不需要删孤儿设备。
+
+## v12 更新（车窗状态显示仍不对：加诊断传感器 + 扩大字段候选）
+
+**v12 修复点**：
+- 新增「车辆原始数据」诊断传感器，把车端返回的完整 vehicle_status JSON 原样放到属性（按顶层块拆开放出，另附 \_all_keys 点路径列表，可 Ctrl+F 搜字段名）；
+- 车窗状态传感器的属性新增 \_debug_all_window_fields：递归扫描整份 JSON，把所有含 window/win/glass/车窗关键词的字段（不管方位是否匹配）悉数列出——真实字段名一定在里面；
+- 方位关键字扩充：增加 flwin/frwin/rlwin/rrwin、winfl/winfr/winrl/winrr、拼音 zj/fj/zh/yh 等更多组合；
+- 顶层块额外暴露 vehicleClimateStatus / vehicleBatteryStatus / vehicleEngineStatus / additionalVehicleStatus / \_xchanger_extra，方便比对。
+- **天窗、遮阳帘、所有开关/按钮/定位/充电桩 一律未动。**
+
+## v11 更新（车窗状态显示不准：递归字段扫描 + 排障诊断）
+
+**v10 遗留问题**：银河 A7 四门车窗字段**不是**固定位于顶层
+`vehicleWindowStatus.windowStatusDriver` 这种命名里，而是可能藏在任意嵌套层级
+或用非标准命名（如 `windowLightOpen`、`windowFullOpen`、`win_driver=ajar`、
+`windowStatusFrontLeft=1` 等），且关闭时不下发。v10 仅在已知块里按候选字段名查找，
+很容易漏读或错判（例如「右后微开」被错判为「副驾微开」）。
+
+**v11 修复点**：
+
+1. **递归扫描整份车辆状态 JSON**：字段名不再硬编码到特定块，任意层级都能命中。
+2. **方位关键字「最长优先」匹配**：`windowStatusPassengerRear` 优先命中 `passengerrear`
+   → 右后，不再被 `passenger` 抢走显示成「副驾微开」。
+3. **补全 VC 整体枚举字段**：`windowLightOpen=1`、`windowFullOpen=1`、
+   `windowClose=1` 分别对应微开/全开/全关（与青龙脚本控制命令同名）。
+4. **VC 通道判定更稳**：只要 `vehicleWindowStatus` 里能读到 `sunroofPos`/`curtainPos`
+   （说明这是 VC 通道报文、天窗已可上报），就认定车窗系统在工作，**未下发字段
+   的窗自动判「全关」**；仅在确实走 XCHANGER 回退且无任何车窗字段时才显示「未知」。
+5. **排障属性**：在「车窗状态」实体的属性里新增 `_命中字段`，列出所有匹配到的
+   字段完整路径和原始值；继续保留 `_raw_vehicleWindowStatus` /
+   `_raw_vehicleDoorCoverStatus`，方便对照真实字段名一次性对齐。
+6. 天窗/遮阳帘同步加了递归兜底查找，避免 VC 通道字段层级变化时读数异常。
+
+**部署提示**：本次只改 `sensor.py` 和 `README.md`，覆盖 `custom_components/geely_galaxy/`
+下同名文件 → 删除 `__pycache__/` → 重启 Home Assistant 即可，无需重新配置集成，
+也**不需要**像 v9 那样手动删孤儿设备。
+
+**排障用法**：如果装完后车窗状态仍有异常，打开「车窗状态」实体 → 属性，
+把里面 `_命中字段` 和 `_raw_vehicleWindowStatus` 的内容发给作者即可定位。
+
+## v10 更新（本次修复「车窗已关闭时状态不显示」）
+
+**问题现象**（实车反馈）：天窗、遮阳帘读数正常；但**车窗状态在车窗关闭时不显示**——
+车端上报的车窗字段取值形如「微开 / 全开」，**关闭时该字段压根不下发**，
+于是四个车窗一个都读不到，实体显示「未知」。
+
+**根因**：`v9` 里车窗传感器的取值判读只认数字码（`1/2/3`）与少量英文，
+且**字段缺失一律当作「未知」**；对银河A7 这种「关闭即不发字段」的车端报文，
+就永远拿不到「关闭」这个状态。
+
+**修复方式**（只动 `sensor.py` 一处，**开关逻辑一律未改**）：
+
+1. 取值判读 `_window_status_label()` 扩展为同时兼容**数字码 / 英文 / 中文**：
+   全开族 `1 / open / 打开 / 全开 / 全开车窗`，微开族 `3 / ajar / 微开 / 半开 / 微开车窗`，
+   关闭族 `0 / 2 / close / 关闭 / 全关 / 已关闭`；
+2. 新增 `_window_field_label()`：字段**存在但为空串**时也判为「全关」（部分通道用空串表示关闭）；
+3. 车窗块优先取 **`vehicleWindowStatus`**（银河A7 的 VC 车窗块），
+   其次 `vehicleDoorCoverStatus`、`vehicleClimateStatus`，XCHANGER 车型继续兜底到
+   `additionalVehicleStatus.*`（含 `winStatus*`）；四个车窗的候选字段名统一扩充为
+   `windowStatus* / windowPos* / winStatus* / window*/win*` 等多套命名；
+4. **关键**：只要 `vehicleWindowStatus` 块存在（说明车端在报车窗系统），
+   其中**未出现的窗即判为「全关」**——这正好对上银河A7「关闭时不发字段」的行为；
+   其它通道（doorCover / XCHANGER）仍坚持「找得到才判读」，绝不臆造数值；
+5. 额外支持「整体车窗字段」（`windowStatus / windowsStatus / windowOpenStatus /
+   windowState / winStatus` 等），命中时四窗同值；
+6. 实体属性里继续原样暴露 `_raw_vehicleWindowStatus`（并新增 `_raw_vehicleDoorCoverStatus`），
+   方便随时核对你车端的真实字段名与取值。
+
+**已验证**（模拟 VC 报文，全部通过）：
+
+| 场景 | 截屏前的车窗状态 | 主驾/副驾/左后/右后 |
+| --- | --- | --- |
+| 主驾=微开、副驾=全开，后两窗未上报 | 部分打开 | 微开 / 全开 / **全关** / **全关** |
+| `vehicleWindowStatus` 只剩天窗/遮阳帘（四窗全关） | **全关** | 全关 / 全关 / 全关 / 全关 |
+| 整体字段 `windowStatus='微开'` | 微开 | 微开 / 微开 / 微开 / 微开 |
+| 数字码：主驾=1，其余未上报 | 部分打开 | 全开 / 全关 / 全关 / 全关 |
+| 老车型：只有 `doorLockStatusDriver` | 未知（不臆造） | — |
+| XCHANGER：`climateStatus.winStatusDriver='3'` | 微开 | 微开 / — |
+
+## v9 更新（修复「实体散落到多个设备 + 天窗/车窗状态读数错误」）
 
 **问题现象**：
 
@@ -32,7 +202,7 @@
 5. `device_tracker` 的 `device_info` 改成与传感器/开关/按钮**完全一致**（`identifiers={(DOMAIN, vin)}`、`name=车型`），
    车辆位置并入车型设备；`unique_id` 保持旧值不变，升级后不会产生孤儿实体。
 
-**⚠️ 需要你实机复核的一点（唯一不确定项）**：
+**⚠️ 需要你实机复核的一点（已在 v10 闭环）**：
 
 银河A7 的 VC 状态下，**天窗/遮阳帘确定在 `vehicleWindowStatus`**（已对齐另一维护分支 Eternity-h/geely-galaxy 的写法）；
 但**四门车窗是否上报开合状态、字段叫什么，取决于车型**。请打开「车窗状态」实体看它的属性：

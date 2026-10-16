@@ -1,0 +1,311 @@
+--- v12/geely_galaxy/sensor.py	2026-10-16 13:09:31.000000000 +0800
++++ v13/sensor.py	2026-10-16 13:32:57.186389404 +0800
+@@ -1923,12 +1923,17 @@
+ 
+ 
+ def _window_status_label(value_str: str | None) -> str | None:
+-    """把单窗/单部件状态值翻译为中文。
++    """把单窗/单部件状态码翻译为中文。
+ 
+-    兼容不同车型/通道的取值习惯（数字码 / 英文 / 中文）：
+-        1 / open / 打开 / 全开 / 全开车窗      -> 全开
+-        3 / ajar / 微开 / 半开 / 微开车窗      -> 微开
+-        0 / 2 / close / 关闭 / 全关 / 已关闭   -> 全关
++    吉利 VC 通道（银河A7/E5 等新车型走 /vc/app/v1/...）状态码约定：
++        1 / close / closed / 关闭 / 全关 / 已关闭 / off / false  -> 全关
++        2 / open / 打开 / 全开 / on / true                      -> 全开
++        3 / ajar / 微开 / 半开 / lightopen                       -> 微开
++        0 作为"未上报/无效"，不做判读（返回 None）。
++
++    注：老 L7 时代 vehicleDoorCoverStatus.sunroofStatus 曾用 1=打开/2=关闭，
++    但该字段在 VC 通道已被新命名 sunroofOpenStatus 替代且语义反转；
++    天窗/遮阳帘优先读 *Pos（开度百分比）而非 openStatus，此处映射仅作兜底。
+     """
+     if value_str is None:
+         return None
+@@ -1936,12 +1941,22 @@
+     if v == "":
+         return None
+     low = v.lower()
+-    if low in ("1", "open", "打开", "全开", "true", "on", "fullopen", "full_open") or "全开" in v:
++    # 英文/中文显式语义（跨通道通用）
++    if low in ("open", "opened", "打开", "全开", "fullopen", "full_open", "on", "true") or "全开" in v:
+         return "全开"
+-    if low in ("3", "微开", "半开", "ajar", "half", "lightopen", "light_open") or "微开" in v or "半开" in v:
++    if low in ("ajar", "微开", "半开", "lightopen", "light_open", "half") or "微开" in v or "半开" in v:
+         return "微开"
+-    if low in ("0", "2", "close", "closed", "关闭", "全关", "false", "off") or "关" in v:
++    if low in ("close", "closed", "关闭", "全关", "已关闭", "off", "false") or "关" in v:
+         return "全关"
++    # 数字码（VC 通道约定：1=关 / 2=全开 / 3=微开）
++    if low == "1":
++        return "全关"
++    if low == "2":
++        return "全开"
++    if low == "3":
++        return "微开"
++    if low == "0":
++        return None
+     return f"未知({value_str})"
+ 
+ 
+@@ -2009,11 +2024,14 @@
+                   "winopenstatus", "allwindow", "allwindowstatus",
+                   "windowlightopen", "windowfullopen", "windowclose",
+                   "windowsts", "windowst", "winsts", "winst")
+-# 排除词：命中这些就不是车窗（例如 sunroof/curtain/doorLock/windowlock）
++# 排除词：命中这些就不是「窗状态」（如 sunroof/curtain/门锁/车窗升降中/位置量）
+ _EXCLUDE_HINTS = ("sunroof", "curtain", "sunshade", "skylight", "doorlock",
+                   "lockstatus", "windowlock", "windowup", "windowdown",
+                   "windowmove", "winpospct", "windowpospct",
+-                  "dooropen", "windowanti", "winanti")
++                  "dooropen", "windowanti", "winanti",
++                  # winPos* 是位置量（银河A7 实测值为 8，不是开度百分比），
++                  # 不能直接当"全开/全关/微开"状态判读，单独收集到属性里。
++                  "winpos", "windowpos")
+ # 只要字段名里含这些词，就归到「车窗候选」（不限方位，统统收集给用户 debug）
+ _WINDOW_HINTS = ("window", "win", "glass", "chechuang", "车窗")
+ 
+@@ -2100,34 +2118,52 @@
+ 
+     _WINDOWS = ("主驾", "副驾", "左后", "右后")
+ 
+-    # 分窗状态可能的字段名（保留旧版精确匹配，提高命中顺序）
++    # 分窗状态字段（只读 winStatus* 等布尔/枚举型字段）。
++    # winPos* 是车端返回的"位置量"，银河A7 VC 通道实测 winPos='8' 并非 0-100 开度百分比，
++    # 不能直接当成状态判读；单独收集后放进实体属性供核对。
+     _WINDOW_KEYS = {
+         "主驾": (
+-            "windowStatusDriver", "windowPosDriver", "winStatusDriver", "windowDriver",
+-            "driverWindowStatus", "driverWindowPos", "frontLeftWindowStatus",
+-            "leftFrontWindowStatus", "winDriver",
+-            "windowPosFrontLeft", "windowStatusFrontLeft",
++            "windowStatusDriver", "winStatusDriver", "driverWindowStatus",
++            "windowDriverStatus", "driverWindowOpenStatus",
++            "frontLeftWindowStatus", "leftFrontWindowStatus",
++            "windowStatusFrontLeft", "windowStatusLeftFront",
+         ),
+         "副驾": (
+-            "windowStatusPassenger", "windowPosPassenger", "winStatusPassenger", "windowPassenger",
+-            "passengerWindowStatus", "passengerWindowPos", "frontRightWindowStatus",
+-            "rightFrontWindowStatus", "winPassenger",
+-            "windowPosFrontRight", "windowStatusFrontRight",
++            "windowStatusPassenger", "winStatusPassenger", "passengerWindowStatus",
++            "windowPassengerStatus", "passengerWindowOpenStatus",
++            "frontRightWindowStatus", "rightFrontWindowStatus",
++            "windowStatusFrontRight", "windowStatusRightFront",
+         ),
+         "左后": (
+-            "windowStatusDriverRear", "windowPosDriverRear", "winStatusDriverRear",
+-            "windowDriverRear", "driverRearWindowStatus", "driverRearWindowPos",
+-            "rearLeftWindowStatus", "leftRearWindowStatus", "winDriverRear",
+-            "windowPosRearLeft", "windowStatusRearLeft",
++            "windowStatusDriverRear", "winStatusDriverRear", "driverRearWindowStatus",
++            "windowDriverRearStatus", "driverRearWindowOpenStatus",
++            "rearLeftWindowStatus", "leftRearWindowStatus",
++            "windowStatusRearLeft", "windowStatusLeftRear",
+         ),
+         "右后": (
+-            "windowStatusPassengerRear", "windowPosPassengerRear", "winStatusPassengerRear",
+-            "windowPassengerRear", "passengerRearWindowStatus", "passengerRearWindowPos",
+-            "rearRightWindowStatus", "rightRearWindowStatus", "winPassengerRear",
+-            "windowPosRearRight", "windowStatusRearRight",
++            "windowStatusPassengerRear", "winStatusPassengerRear", "passengerRearWindowStatus",
++            "windowPassengerRearStatus", "passengerRearWindowOpenStatus",
++            "rearRightWindowStatus", "rightRearWindowStatus",
++            "windowStatusRearRight", "windowStatusRightRear",
+         ),
+     }
+ 
++    # 分窗位置字段（原值记录，不直接判状态）—— VC 通道用 winPos*
++    _WINDOW_POS_KEYS = {
++        "主驾": ("windowPosDriver", "winPosDriver", "driverWindowPos",
++                 "frontLeftWindowPos", "leftFrontWindowPos",
++                 "windowPosFrontLeft", "windowPosLeftFront"),
++        "副驾": ("windowPosPassenger", "winPosPassenger", "passengerWindowPos",
++                 "frontRightWindowPos", "rightFrontWindowPos",
++                 "windowPosFrontRight", "windowPosRightFront"),
++        "左后": ("windowPosDriverRear", "winPosDriverRear", "driverRearWindowPos",
++                 "rearLeftWindowPos", "leftRearWindowPos",
++                 "windowPosRearLeft", "windowPosLeftRear"),
++        "右后": ("windowPosPassengerRear", "winPosPassengerRear", "passengerRearWindowPos",
++                 "rearRightWindowPos", "rightRearWindowPos",
++                 "windowPosRearRight", "windowPosRightRear"),
++    }
++
+     # 整体字段的精确匹配（含 VC 通道常见枚举字段 windowLightOpen/windowFullOpen/windowClose）
+     _OVERALL_KEYS = (
+         "windowStatus", "windowsStatus", "windowOpenStatus", "windowState",
+@@ -2139,16 +2175,19 @@
+         super().__init__(coordinator, entry)
+         self._attr_unique_id = f"{entry.entry_id}_window_status"
+ 
+-    def _scan(self) -> tuple[dict[str, str], dict[str, str], str | None]:
+-        """扫描 vehicle_status，返回 (per_window_states, raw_field_map, overall_label)。
++    def _scan(self) -> tuple[dict[str, str], dict[str, str], dict[str, str], str | None, bool]:
++        """扫描 vehicle_status，返回 (per_window_states, raw_status_map, raw_pos_map, overall_label, has_any_per_window)。
+ 
+         - per_window_states: {主驾/副驾/左后/右后 -> 中文状态}
+-        - raw_field_map: {字段完整路径 -> 原始值}（所有命中字段，含已排除的）
++        - raw_status_map: {字段完整路径 -> 原始状态值}（状态枚举字段）
++        - raw_pos_map: {方位 -> 原始位置量}（winPos* 等位置字段，仅记录不判读）
+         - overall_label: 整体字段解析得到的标签（可能为 None）
+         """
+         result: dict[str, str] = {}
+-        raw_map: dict[str, str] = {}
++        raw_status: dict[str, str] = {}
++        raw_pos: dict[str, str] = {}
+         overall_label: str | None = None
++        has_any_per_window = False
+         blocks = list(_iter_window_blocks(self.vehicle_status))
+ 
+         # --- 1) 精确匹配：遍历已知块里的候选字段 ---
+@@ -2159,60 +2198,83 @@
+                 for k in keys:
+                     if k in block:
+                         label = _window_field_label(block[k])
+-                        raw_map[k] = str(block[k])
++                        raw_status[k] = str(block[k])
+                         if label is not None:
+                             result[w] = label
++                            has_any_per_window = True
++                        break
++            for w, keys in self._WINDOW_POS_KEYS.items():
++                if w in raw_pos:
++                    continue
++                for k in keys:
++                    if k in block:
++                        raw_pos[w] = str(block[k])
+                         break
+             if overall_label is None:
+                 for k in self._OVERALL_KEYS:
+                     if k in block:
+-                        raw_map[k] = str(block[k])
++                        raw_status[k] = str(block[k])
+                         overall_label = _window_field_label(block[k])
+                         break
+ 
+         # --- 2) 启发式递归：覆盖未知字段名/未知层级 ---
+-        has_any_per_window = bool(result)
+         for path, value in _walk(self.vehicle_status):
+             leaf = path.split(".")[-1].split("[")[0]
+-            pos = _match_position(leaf)
+-            if pos is not None:
+-                raw_map[path] = str(value)
++            pos_name = _match_position(leaf)
++            if pos_name is not None:
++                raw_status[path] = str(value)
+                 label = _window_field_label(value)
+-                if label is not None and pos not in result:
+-                    result[pos] = label
++                if label is not None and pos_name not in result:
++                    result[pos_name] = label
+                     has_any_per_window = True
+                 continue
++            # 递归搜 winPos*（只记录，不判状态）
++            low_leaf = leaf.lower().replace("_", "").replace("-", "")
++            if low_leaf.startswith(("winpos", "windowpos")) and "sunroof" not in low_leaf and "curtain" not in low_leaf:
++                # 从字段名里解析方位
++                for pname in self._WINDOWS:
++                    if pname in raw_pos:
++                        continue
++                    for kw in _POS_KEYWORDS[pname]:
++                        if kw in low_leaf:
++                            raw_pos[pname] = str(value)
++                            break
++                continue
+             if overall_label is None and _is_overall(leaf):
+-                raw_map[path] = str(value)
++                raw_status[path] = str(value)
+                 overall_label = _window_field_label(value)
+ 
+-        return result, raw_map, overall_label, has_any_per_window
++        return result, raw_status, raw_pos, overall_label, has_any_per_window
+ 
+-    def _each_window(self) -> dict[str, str]:
+-        per_window, _raw, overall, has_per = self._scan()
++    def _each_window(self) -> tuple[dict[str, str], dict[str, str], dict[str, str], str | None]:
++        per_window, raw_status, raw_pos, overall, has_per = self._scan()
+         result = dict(per_window)
+ 
+         # 判断「车端正在上报车窗系统」的依据（VC 通道）：
+-        #   1) 命中了至少一个分窗字段，或
++        #   1) 命中了至少一个分窗状态字段，或
+         #   2) 命中了整体字段，或
+-        #   3) vehicleWindowStatus 里有 sunroofPos/curtainPos（说明是 VC 通道，
+-        #      四门车窗在该通道下"关闭时不发字段"，可安全补全为全关）。
++        #   3) vehicleWindowStatus 里有 sunroofPos/curtainPos（确认是 VC 通道，
++        #      该通道下四门车窗字段会稳定下发 winStatus*，未读到 = 车端没报 → 保持未知）。
++        #
++        # 实测（银河A7）：车停着、四窗全关时 winStatusDriver/Passenger/DriverRear/PassengerRear
++        # 全部返回 '1'（关闭），winPos* 全部返回 '8'（位置量，非开度%）——四个字段都会下发，
++        # 所以这里不再"块存在就补全关"，而是精确字段命中即判读，未命中留未知避免臆造。
+         vs = self.vehicle_status if isinstance(self.vehicle_status, dict) else {}
+-        vws = vs.get("vehicleWindowStatus") if isinstance(vs, dict) else None
+-        vc_channel = bool(
+-            isinstance(vws, dict)
+-            and (vws.get("sunroofPos") is not None or vws.get("curtainPos") is not None)
+-        )
+ 
+-        if has_per or overall or vc_channel:
++        if has_per:
++            # 命中分窗字段：未命中的窗若整体字段有值则套整体字段，否则保留（车端没报）
+             for w in self._WINDOWS:
+-                if w not in result:
+-                    result[w] = overall or "全关"
+-        return result
++                if w not in result and overall:
++                    result[w] = overall
++        elif overall:
++            for w in self._WINDOWS:
++                result[w] = overall
++
++        return result, raw_status, raw_pos, overall
+ 
+     @property
+     def native_value(self) -> str | None:
+-        ws = self._each_window()
++        ws, _rs, _rp, _ov = self._each_window()
+         if not ws:
+             return "未知"
+         states = set(ws.values())
+@@ -2222,6 +2284,7 @@
+             return "全开"
+         if states == {"微开"}:
+             return "微开"
++        # 混合状态：只要有全开就"部分打开"
+         if "全开" in states and len(states) > 1:
+             return "部分打开"
+         if "微开" in states:
+@@ -2242,18 +2305,25 @@
+ 
+     @property
+     def extra_state_attributes(self) -> dict[str, Any]:
+-        per_window, raw_map, overall, _has_per = self._scan()
++        per_window, raw_status, raw_pos, overall = self._each_window()
+         attrs: dict[str, Any] = {}
+         # 四窗最终判读
+-        ws = self._each_window()
+         for w in self._WINDOWS:
+-            attrs[w] = ws.get(w, "未知")
++            attrs[w] = per_window.get(w, "未知")
++        # 各窗位置量（winPos* 原始值，供排查）
++        if raw_pos:
++            pos_attrs = {}
++            for w in self._WINDOWS:
++                if w in raw_pos:
++                    pos_attrs[w] = raw_pos[w]
++            if pos_attrs:
++                attrs["位置量_raw"] = pos_attrs
+         # 整体字段（如有）
+         if overall:
+             attrs["整体状态_raw"] = overall
+-        # 排障：所有命中的字段路径 + 原始值（方便你对照真实字段名告诉我）
+-        if raw_map:
+-            attrs["_命中字段"] = raw_map
++        # 排障：所有命中的状态字段路径 + 原始值
++        if raw_status:
++            attrs["_命中状态字段"] = raw_status
+         # 排障：原样暴露常见顶层块
+         vs = self.vehicle_status
+         for name in ("vehicleWindowStatus", "vehicleDoorCoverStatus",

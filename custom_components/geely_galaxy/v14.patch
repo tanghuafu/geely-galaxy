@@ -1,0 +1,179 @@
+--- v13_ref/geely_galaxy/sensor.py	2026-10-16 13:35:09.000000000 +0800
++++ v14_src/geely_galaxy/sensor.py	2026-10-16 13:56:13.152972724 +0800
+@@ -1989,6 +1989,42 @@
+     return "部分打开"
+ 
+ 
++def _winpos_label(value: Any) -> tuple[str | None, str | None]:
++    """解读银河A7 VC 通道 winPos* 位置码。
++
++    银河A7 实测字段约定（与 winStatus* 配套）：
++        '0'  -> 全关到位（车窗完全关闭）
++        '8'  -> 未开 / 默认关闭（车窗处于关闭位，未收到开启指令）
++        1-7、9-99 -> 开度百分比（中间位置 = 微开/部分打开）
++        '100' -> 全开到位
++
++    返回：(展示字符串, 状态判读或 None)
++        展示字符串形如 "8(未开/默认关闭)"、"15(开度15%)"；
++        状态判读仅在能确定开/关时返回 "全关"/"微开"/"全开"，
++        用于 winStatus 缺失时的兜底。
++    """
++    if value is None:
++        return None, None
++    s = str(value).strip()
++    if s == "" or s.lower() in ("none", "null"):
++        return None, None
++    if s == "0":
++        return "0(全关到位)", "全关"
++    if s == "8":
++        return "8(未开/默认关闭)", "全关"
++    try:
++        num = int(s)
++    except (TypeError, ValueError):
++        # 非数字：原样返回，不做判读
++        return f"{s}(原始值)", None
++    if 0 < num < 95:
++        return f"{s}(开度{num}%)", "微开"
++    if num >= 95:
++        return f"{s}(开度{num}%)", "全开"
++    # 兜底
++    return f"{s}(原始值)", None
++
++
+ # ====== 关键字启发式：从任意嵌套层级里定位车窗/天窗/遮阳帘字段 ======
+ 
+ # 方位关键字：用于在字段名里识别「这是某一个窗」
+@@ -2118,9 +2154,10 @@
+ 
+     _WINDOWS = ("主驾", "副驾", "左后", "右后")
+ 
+-    # 分窗状态字段（只读 winStatus* 等布尔/枚举型字段）。
+-    # winPos* 是车端返回的"位置量"，银河A7 VC 通道实测 winPos='8' 并非 0-100 开度百分比，
+-    # 不能直接当成状态判读；单独收集后放进实体属性供核对。
++    # 分窗状态字段（winStatus* 等布尔/枚举型字段，主判读依据）。
++    # winPos* 是车端返回的"位置量"：银河A7 VC 通道约定：
++    #   '0'=全关到位, '8'=未开(默认关闭), 其余数字=开度%。
++    # winPos 单独解读为友好描述放进属性，并在 winStatus 缺失时兜底判状态。
+     _WINDOW_KEYS = {
+         "主驾": (
+             "windowStatusDriver", "winStatusDriver", "driverWindowStatus",
+@@ -2180,12 +2217,14 @@
+ 
+         - per_window_states: {主驾/副驾/左后/右后 -> 中文状态}
+         - raw_status_map: {字段完整路径 -> 原始状态值}（状态枚举字段）
+-        - raw_pos_map: {方位 -> 原始位置量}（winPos* 等位置字段，仅记录不判读）
++        - raw_pos_map: {方位 -> 位置码解读字符串}（winPos*，如 "8(未开/默认关闭)"）
++        - raw_pos_state: {方位 -> 由 winPos 判读出的状态}（winStatus 缺失时作兜底）
+         - overall_label: 整体字段解析得到的标签（可能为 None）
+         """
+         result: dict[str, str] = {}
+         raw_status: dict[str, str] = {}
+         raw_pos: dict[str, str] = {}
++        raw_pos_state: dict[str, str] = {}
+         overall_label: str | None = None
+         has_any_per_window = False
+         blocks = list(_iter_window_blocks(self.vehicle_status))
+@@ -2208,7 +2247,11 @@
+                     continue
+                 for k in keys:
+                     if k in block:
+-                        raw_pos[w] = str(block[k])
++                        disp, state_from_pos = _winpos_label(block[k])
++                        if disp:
++                            raw_pos[w] = disp
++                            if state_from_pos:
++                                raw_pos_state[w] = state_from_pos
+                         break
+             if overall_label is None:
+                 for k in self._OVERALL_KEYS:
+@@ -2228,44 +2271,57 @@
+                     result[pos_name] = label
+                     has_any_per_window = True
+                 continue
+-            # 递归搜 winPos*（只记录，不判状态）
++            # 递归搜 winPos*（解读位置码，winStatus 缺失时兜底判状态）
+             low_leaf = leaf.lower().replace("_", "").replace("-", "")
+             if low_leaf.startswith(("winpos", "windowpos")) and "sunroof" not in low_leaf and "curtain" not in low_leaf:
+-                # 从字段名里解析方位
++                # 从字段名里解析方位（最长关键字优先）
++                hits: list[tuple[int, str]] = []
+                 for pname in self._WINDOWS:
+                     if pname in raw_pos:
+                         continue
+                     for kw in _POS_KEYWORDS[pname]:
+                         if kw in low_leaf:
+-                            raw_pos[pname] = str(value)
+-                            break
++                            hits.append((len(kw), pname))
++                if hits:
++                    hits.sort(key=lambda x: -x[0])
++                    pname = hits[0][1]
++                    disp, state_from_pos = _winpos_label(value)
++                    if disp:
++                        raw_pos[pname] = disp
++                        if state_from_pos and pname not in result:
++                            # winStatus 未命中时，用 winPos 兜底
++                            result[pname] = state_from_pos
++                            has_any_per_window = True
++                            raw_pos_state[pname] = state_from_pos
+                 continue
+             if overall_label is None and _is_overall(leaf):
+                 raw_status[path] = str(value)
+                 overall_label = _window_field_label(value)
+ 
+-        return result, raw_status, raw_pos, overall_label, has_any_per_window
++        return result, raw_status, raw_pos, raw_pos_state, overall_label, has_any_per_window
+ 
+     def _each_window(self) -> tuple[dict[str, str], dict[str, str], dict[str, str], str | None]:
+-        per_window, raw_status, raw_pos, overall, has_per = self._scan()
++        scan_result = self._scan()
++        per_window, raw_status, raw_pos, raw_pos_state, overall, has_per = scan_result
+         result = dict(per_window)
+ 
+         # 判断「车端正在上报车窗系统」的依据（VC 通道）：
+-        #   1) 命中了至少一个分窗状态字段，或
+-        #   2) 命中了整体字段，或
+-        #   3) vehicleWindowStatus 里有 sunroofPos/curtainPos（确认是 VC 通道，
+-        #      该通道下四门车窗字段会稳定下发 winStatus*，未读到 = 车端没报 → 保持未知）。
++        #   1) 命中了至少一个分窗状态字段（winStatus* 或 winPos* 兜底），或
++        #   2) 命中了整体字段。
+         #
+-        # 实测（银河A7）：车停着、四窗全关时 winStatusDriver/Passenger/DriverRear/PassengerRear
+-        # 全部返回 '1'（关闭），winPos* 全部返回 '8'（位置量，非开度%）——四个字段都会下发，
+-        # 所以这里不再"块存在就补全关"，而是精确字段命中即判读，未命中留未知避免臆造。
++        # 实测（银河A7）：四窗全关时 winStatus*='1'、winPos*='8'，四个字段都会下发，
++        # 因此精确字段命中即判读；未命中窗在 VC 通道且已有任一分窗命中时补「全关」。
+         vs = self.vehicle_status if isinstance(self.vehicle_status, dict) else {}
+ 
+         if has_per:
+-            # 命中分窗字段：未命中的窗若整体字段有值则套整体字段，否则保留（车端没报）
++            # 命中分窗字段：未命中的窗若有 winPos 兜底状态则用之；
++            # 若整体字段有值则套整体；否则保留（车端没报）
+             for w in self._WINDOWS:
+-                if w not in result and overall:
+-                    result[w] = overall
++                if w not in result:
++                    if w in raw_pos_state:
++                        result[w] = raw_pos_state[w]
++                    elif overall:
++                        result[w] = overall
+         elif overall:
+             for w in self._WINDOWS:
+                 result[w] = overall
+@@ -2310,14 +2366,14 @@
+         # 四窗最终判读
+         for w in self._WINDOWS:
+             attrs[w] = per_window.get(w, "未知")
+-        # 各窗位置量（winPos* 原始值，供排查）
++        # 各窗位置量（winPos* 解读后：0=全关到位, 8=未开/默认关闭, 数字=开度%）
+         if raw_pos:
+             pos_attrs = {}
+             for w in self._WINDOWS:
+                 if w in raw_pos:
+                     pos_attrs[w] = raw_pos[w]
+             if pos_attrs:
+-                attrs["位置量_raw"] = pos_attrs
++                attrs["位置量"] = pos_attrs
+         # 整体字段（如有）
+         if overall:
+             attrs["整体状态_raw"] = overall
