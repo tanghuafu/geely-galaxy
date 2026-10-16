@@ -1,8 +1,47 @@
-# Geely Galaxy 吉利银河 Home Assistant 集成（银河A7适配版 v8）
+# Geely Galaxy 吉利银河 Home Assistant 集成（银河A7适配版 v9）
 
 本版本基于 lyj5812/geely-galaxy 原版，针对银河 A7 插混做了以下增强与修复。
 
-## v8 更新（本次修复「关闭极速降温后座椅通风仍在转」）
+## v9 更新（本次修复「实体散落到多个设备 + 天窗/车窗状态读数错误」）
+
+**问题现象**：
+
+1. 集成里除了车型设备「银河A7」，还多出几个名为「吉利银河」的设备（车辆状态、车窗状态、天窗状态、遮阳帘状态），
+   以及一个**未命名设备**（车辆位置）；
+2. 天窗、车窗状态传感器读数不对（银河A7 走 VC 通道）。
+
+**根因（已在代码中确认）**：
+
+| 问题 | 根因 |
+| --- | --- |
+| 多出「吉利银河」设备 | `sensor.py` 里 `GeelyWindowStatusSensor` / `GeelySunroofStatusSensor` / `GeelySunshadeStatusSensor` / `GeelyVehicleStateSensor` 被**定义了两次**，文件末尾那版（`CoordinatorEntity` 版）覆盖了前面的 `GeelyBaseSensor` 版；它的设备标识写成 `coordinator.data.get("vin")`，但协调器数据里**没有顶层 `vin`**，于是退化成 `(DOMAIN, 该实体的 unique_id)` —— **每个实体各自变成一个名为「吉利银河」的设备** |
+| 未命名设备 | `device_tracker.py` 的 `_attr_device_info` 只写了 `identifiers`、**没写 `name`**，HA 只能登记成「未命名设备」 |
+| 天窗/遮阳帘读数错 | 两个传感器读的是 `vehicleDoorCoverStatus.sunroofStatus / sunshadeStatus`，而银河A7（VC 通道）实际把天窗/遮阳帘放在 **`vehicleWindowStatus`** 块：`sunroofPos` / `sunroofOpenStatus` / `curtainPos` / `curtainOpenStatus` |
+| 重复注册 | 车窗/天窗/遮阳帘在 `async_setup_entry` 里被 `entities.extend` 了**两次**，同一个 `unique_id` 会冲突 |
+
+**修复方式**（只动 `sensor.py`、`device_tracker.py`，**开关逻辑一律未改**）：
+
+1. 删掉文件末尾重复定义的那一整段（含 `_find_value_recursive` 等只被它用到的辅助函数），
+   并删掉 `async_setup_entry` 里的重复注册块 —— 现在每个实体只定义、只注册一次；
+2. 车窗/天窗/遮阳帘三个状态传感器统一继承 `GeelyBaseSensor`，因此**自动与车型设备 `(DOMAIN, vin)` 合并**；
+3. 天窗、遮阳帘改为优先读 **`vehicleWindowStatus`**（`sunroofPos` / `curtainPos` 开度百分比判状态），
+   `sunroofOpenStatus` / `curtainOpenStatus` 作次选，`vehicleDoorCoverStatus.sunroofStatus / sunshadeStatus` 仅作老车型兜底；
+4. 车窗状态改为在 `vehicleWindowStatus`（其次 `vehicleDoorCoverStatus`、XCHANGER 的 `additionalVehicleStatus.*`）里按
+   多候选字段名查找四门车窗；**车端如果不上报车窗开合，就显示「未知」，不再臆造数值**，
+   并把原始块放进实体属性 `_raw_vehicleWindowStatus` 便于核对；
+5. `device_tracker` 的 `device_info` 改成与传感器/开关/按钮**完全一致**（`identifiers={(DOMAIN, vin)}`、`name=车型`），
+   车辆位置并入车型设备；`unique_id` 保持旧值不变，升级后不会产生孤儿实体。
+
+**⚠️ 需要你实机复核的一点（唯一不确定项）**：
+
+银河A7 的 VC 状态下，**天窗/遮阳帘确定在 `vehicleWindowStatus`**（已对齐另一维护分支 Eternity-h/geely-galaxy 的写法）；
+但**四门车窗是否上报开合状态、字段叫什么，取决于车型**。请打开「车窗状态」实体看它的属性：
+
+- 若属性里出现了四个车窗（主驾/副驾/左后/右后）→ 说明字段名已命中，正常；
+- 若只有 `_raw_vehicleWindowStatus` 一项、状态显示「未知」→ 说明你的车端确实不上报车窗开合，
+  把 `_raw_vehicleWindowStatus` 的原始内容贴给我，我按真实字段名补进候选列表即可（改动只在 `sensor.py` 一处）。
+
+## v8 更新（修复「关闭极速降温后座椅通风仍在转」）
 
 **问题现象**：点「关闭极速降温」后，空调关了，但**座椅通风仍然在转**。
 
@@ -78,6 +117,8 @@
 - **油量（%）、油量续航（km）、综合续航（km）**（插混车型）
 - 车门锁状态
 - **后备箱状态**（已锁定 / 已解锁）
+- **车辆状态**（已熄火 / 驻车 / 空挡 / 行驶中）
+- **车窗状态、天窗状态、遮阳帘状态**（银河A7 走 VC 通道，读 `vehicleWindowStatus`；开度放在属性里）
 - 空调状态、充电状态、驻车图片等
 
 ### 定位 (device_tracker)
@@ -90,7 +131,7 @@
 3. 删除 `/config/custom_components/geely_galaxy/__pycache__/`；
 4. **完全重启 Home Assistant**（不能只重载集成，因包含 device_tracker 平台变更）。
 
-本次只改了 `api.py`、`button.py`、`README.md`（`__init__.py` 无变化），如已装 v7，覆盖后重启即可，不需要重新配置。
+本次（v9）只改了 `sensor.py`、`device_tracker.py`、`README.md`（`api.py` / `button.py` / `switch.py` / `__init__.py` 均无变化），如已装 v8，覆盖后重启即可，不需要重新配置。
 
 ## 车机端必要设置
 

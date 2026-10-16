@@ -203,26 +203,41 @@ async def async_setup_entry(
     """Set up the Geely Galaxy device tracker."""
     coordinator: GeelyDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
     api = hass.data[DOMAIN][entry.entry_id]["api"]
-    async_add_entities([GeelyVehicleTracker(coordinator, api)], True)
+    async_add_entities([GeelyVehicleTracker(coordinator, entry, api)], True)
 
 
 class GeelyVehicleTracker(CoordinatorEntity, TrackerEntity):
     """代表车辆当前位置的 device_tracker。"""
 
     _attr_has_entity_name = True
-    _attr_translation_key = "vehicle_location"
     _attr_name = "车辆位置"
     _attr_icon = "mdi:map-marker"
     _attr_source_type = SourceType.GPS
 
-    def __init__(self, coordinator: GeelyDataUpdateCoordinator, api) -> None:
+    def __init__(self, coordinator: GeelyDataUpdateCoordinator, entry: ConfigEntry, api) -> None:
         """Initialize the tracker."""
         super().__init__(coordinator)
+        self._entry = entry
         self._api = api
+        # unique_id 保持与旧版一致，避免升级后旧实体变成「不可用」的孤儿实体
         device_sn = getattr(api, "device_sn", None) or "geely_galaxy"
         self._attr_unique_id = f"{device_sn}_vehicle_location"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, device_sn)},
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        """与其它实体共用同一个「车辆」设备。
+
+        旧版只写了 identifiers、没有 name，HA 会把它登记成一个「未命名设备」；
+        这里改成与传感器/开关/按钮完全一致的设备信息，车辆位置就会并到车型设备下。
+        """
+        vehicle_info = self.coordinator.data.get("vehicle_info", {}) if self.coordinator.data else {}
+        vin = vehicle_info.get("vin", "unknown")
+        model = vehicle_info.get("seriesNameVs", "吉利银河")
+        return {
+            "identifiers": {(DOMAIN, vin)},
+            "name": f"{model}",
+            "manufacturer": "吉利汽车",
+            "model": model,
         }
 
     @property

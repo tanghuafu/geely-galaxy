@@ -383,13 +383,9 @@ async def async_setup_entry(
         GeelyTirePressureSensor(coordinator, entry, "passenger_rear", "右后"),
     ])
 
-    # ========== 新增：车辆/车窗/天窗/遮阳帘状态 ==========
-    entities.extend([
-        GeelyVehicleStateSensor(coordinator, entry),
-        GeelyWindowStatusSensor(coordinator, entry),
-        GeelySunroofStatusSensor(coordinator, entry),
-        GeelySunshadeStatusSensor(coordinator, entry),
-    ])
+    # 说明：车窗/天窗/遮阳帘状态传感器已在前面「新增状态」一段注册，
+    # 这里不再重复注册（原来的重复注册会让 HA 报 unique_id 冲突，
+    # 且会把实体推到另一个设备里）。
 
     # 为每个家用充电桩创建独立设备和传感器
     home_chargers = coordinator.data.get("home_chargers", {}) if coordinator.data else {}
@@ -1918,382 +1914,260 @@ class GeelyVehicleDrivingSensor(GeelyBaseSensor):
 
 
 def _window_status_label(value_str: str | None) -> str | None:
-    """将单窗状态码翻译为中文。1=全开,2=全关,3=微开"""
-    if value_str is None: return None
-    v = str(value_str)
-    return {"1": "全开", "2": "全关", "3": "微开"}.get(v, f"未知({v})")
+    """把单窗/单部件状态码翻译为中文。
+
+    兼容不同车型的取值习惯：
+        1 / open / 打开         -> 全开
+        0 / 2 / close / 关闭     -> 全关
+        3 / ajar / 微开 / 半开   -> 微开
+    """
+    if value_str is None:
+        return None
+    v = str(value_str).strip().lower()
+    if v in ("1", "open", "打开", "全开", "true", "on"):
+        return "全开"
+    if v in ("0", "2", "close", "关闭", "全关", "false", "off"):
+        return "全关"
+    if v in ("3", "微开", "半开", "ajar", "half"):
+        return "微开"
+    return f"未知({value_str})"
+
+
+def _pos_to_label(pos: Any) -> str | None:
+    """按开度百分比判断状态：0=全关，≈100=全开，其余=部分打开。"""
+    if pos is None:
+        return None
+    try:
+        p = float(pos)
+    except (TypeError, ValueError):
+        return None
+    if p <= 0.5:
+        return "全关"
+    if p >= 99.5:
+        return "全开"
+    return "部分打开"
+
+
+def _window_blocks(vehicle_status: Any) -> list[dict[str, Any]]:
+    """按优先级收集可能承载车窗/天窗/遮阳帘状态的块。
+
+    银河A7（VC 通道）的实测位置是 ``vehicleWindowStatus``：
+        sunroofPos / sunroofOpenStatus / curtainPos / curtainOpenStatus
+    老车型或其它通道可能放在 ``vehicleDoorCoverStatus``，XCHANGER 车型
+    （L7 等）则在自己的 additionalVehicleStatus.* 里，这里一并兜底。
+    """
+    blocks: list[dict[str, Any]] = []
+    vs = vehicle_status if isinstance(vehicle_status, dict) else {}
+    for name in ("vehicleWindowStatus", "vehicleDoorCoverStatus"):
+        blk = vs.get(name)
+        if isinstance(blk, dict):
+            blocks.append(blk)
+    xc = vs.get("_xchanger_extra")
+    if isinstance(xc, dict):
+        addi = xc.get("additionalVehicleStatus")
+        if isinstance(addi, dict):
+            for seg in addi.values():
+                if isinstance(seg, dict):
+                    blocks.append(seg)
+    return blocks
 
 
 class GeelyWindowStatusSensor(GeelyBaseSensor):
-    """车窗整体状态传感器，属性中显示四个车窗各自状态。"""
+    """车窗整体状态（四个车窗在属性中分别显示）。
+
+    注意：银河A7（VC 通道）的车端状态里，天窗/遮阳帘固定放在
+    ``vehicleWindowStatus``（sunroofPos / curtainPos），但**是否上报四门车窗
+    开合状态取决于车型**。这里按「字段名多候选」的方式在
+    ``vehicleWindowStatus`` 等块里查找，找不到就返回「未知」，并把原始块
+    放进属性里便于核对，绝不臆造数值。
+    """
 
     _attr_name = "车窗状态"
     _attr_icon = "mdi:car-window"
 
-    # 四个车窗可能的字段名（兼容不同车型）
+    # 四个车窗可能的字段名（兼容不同车型/通道的命名习惯）
     _WINDOW_KEYS = {
-        "主驾": ("windowStatusDriver", "driverWindowStatus", "leftFrontWindowStatus"),
-        "副驾": ("windowStatusPassenger", "passengerWindowStatus", "rightFrontWindowStatus"),
-        "左后": ("windowStatusDriverRear", "rearLeftWindowStatus", "leftRearWindowStatus"),
-        "右后": ("windowStatusPassengerRear", "rearRightWindowStatus", "rightRearWindowStatus"),
+        "主驾": (
+            "windowPosDriver", "windowStatusDriver", "driverWindowPos",
+            "driverWindowStatus", "winPosDriver", "winStatusDriver",
+            "leftFrontWindowPos", "leftFrontWindowStatus",
+        ),
+        "副驾": (
+            "windowPosPassenger", "windowStatusPassenger", "passengerWindowPos",
+            "passengerWindowStatus", "winPosPassenger", "winStatusPassenger",
+            "rightFrontWindowPos", "rightFrontWindowStatus",
+        ),
+        "左后": (
+            "windowPosDriverRear", "windowStatusDriverRear", "driverRearWindowPos",
+            "driverRearWindowStatus", "winPosDriverRear", "winStatusDriverRear",
+            "leftRearWindowPos", "leftRearWindowStatus",
+        ),
+        "右后": (
+            "windowPosPassengerRear", "windowStatusPassengerRear", "passengerRearWindowPos",
+            "passengerRearWindowStatus", "winPosPassengerRear", "winStatusPassengerRear",
+            "rightRearWindowPos", "rightRearWindowStatus",
+        ),
     }
 
     def __init__(self, coordinator, entry):
         super().__init__(coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_window_status"
 
-    def _door_cover(self) -> dict:
-        vs = self.vehicle_status
-        dc = vs.get("vehicleDoorCoverStatus", {})
-        # 兼容 XCHANGER
-        xc = vs.get("_xchanger_extra", {})
-        if isinstance(xc, dict):
-            addi = xc.get("additionalVehicleStatus", {})
-            if isinstance(addi, dict):
-                merged = dict(dc)
-                for seg in addi.values():
-                    if isinstance(seg, dict): merged.update(seg)
-                dc = merged
-        return dc
-
     def _each_window(self) -> dict[str, str]:
-        dc = self._door_cover()
-        result = {}
-        for label, keys in self._WINDOW_KEYS.items():
-            for k in keys:
-                if k in dc and dc[k] is not None:
-                    result[label] = _window_status_label(dc[k])
-                    break
+        result: dict[str, str] = {}
+        for block in _window_blocks(self.vehicle_status):
+            for label, keys in self._WINDOW_KEYS.items():
+                if label in result:
+                    continue
+                for k in keys:
+                    if k in block and block[k] is not None:
+                        result[label] = _window_status_label(block[k])
+                        break
         return result
 
     @property
     def native_value(self) -> str | None:
         ws = self._each_window()
-        if not ws: return None
+        if not ws:
+            return None
         states = set(ws.values())
         if states == {"全关"}:
             return "全关"
-        if all(s == "全开" for s in states.values()):
+        if states == {"全开"}:
             return "全开"
         if states == {"微开"}:
-            return "微开"
-        # 混合状态
-        if "全开" in states and "微开" in states:
-            return "部分打开"
-        if "全开" in states:
-            return "部分打开"
-        if "微开" in states:
-            return "微开"
-        if "全关" in states and ("全开" in states or "微开" in states):
-            return "部分打开"
-        return "未知"
-
-    @property
-    def icon(self) -> str:
-        v = self.native_value
-        if v == "全关": return "mdi:car-window-closed"
-        if v == "全开": return "mdi:car-window-down"
-        if v == "微开": return "mdi:car-window-arrows"
-        return "mdi:car-window"
-
-    @property
-    def extra_state_attributes(self) -> dict:
-        return self._each_window()
-
-
-class GeelySunroofStatusSensor(GeelyBaseSensor):
-    """天窗状态（全关/微开/全开）。"""
-
-    _attr_name = "天窗状态"
-    _attr_icon = "mdi:roof"
-
-    _KEYS = ("sunroofStatus", "sunroofOpenStatus", "sunroofOpen")
-
-    def __init__(self, coordinator, entry):
-        super().__init__(coordinator, entry)
-        self._attr_unique_id = f"{entry.entry_id}_sunroof_status"
-
-    def _raw(self):
-        dc = self.vehicle_status.get("vehicleDoorCoverStatus", {})
-        for k in self._KEYS:
-            if k in dc and dc[k] is not None:
-                return str(dc[k])
-        return None
-
-    @property
-    def native_value(self) -> str | None:
-        return _window_status_label(self._raw())
-
-    @property
-    def icon(self) -> str:
-        v = self.native_value
-        if v == "全关": return "mdi:roof"
-        if v == "全开": return "mdi:car-windshield-outline"
-        return "mdi:window-maximize"
-
-
-class GeelySunshadeStatusSensor(GeelyBaseSensor):
-    """遮阳帘状态（全关/半开/全开）。"""
-
-    _attr_name = "遮阳帘状态"
-    _attr_icon = "mdi:blinds"
-
-    _KEYS = ("sunshadeStatus", "skylightCurtainStatus", "sunCurtainStatus", "curtainStatus")
-
-    def __init__(self, coordinator, entry):
-        super().__init__(coordinator, entry)
-        self._attr_unique_id = f"{entry.entry_id}_sunshade_status"
-
-    def _raw(self):
-        dc = self.vehicle_status.get("vehicleDoorCoverStatus", {})
-        for k in self._KEYS:
-            if k in dc and dc[k] is not None:
-                return str(dc[k])
-        return None
-
-    @property
-    def native_value(self) -> str | None:
-        return _window_status_label(self._raw())
-
-    @property
-    def icon(self) -> str:
-        v = self.native_value
-        if v == "全关": return "mdi:blinds"
-        if v == "全开": return "mdi:blinds-open"
-        return "mdi:blinds-horizontal"
-
-
-# ========== New state sensors ==========
-def _find_value_recursive(data, keys, _path=""):
-    """Recursively search for any of the keys in nested dict/list."""
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if k in keys:
-                return v
-            found = _find_value_recursive(v, keys, _path + "." + k)
-            if found is not None:
-                return found
-    elif isinstance(data, list):
-        for item in data:
-            found = _find_value_recursive(item, keys, _path)
-            if found is not None:
-                return found
-    return None
-
-
-def _safe_float(v):
-    try:
-        return float(v)
-    except (ValueError, TypeError):
-        return None
-
-
-def _get_status_value(vs, keys):
-    v = _find_value_recursive(vs, keys)
-    return v
-
-
-class GeelyVehicleStateSensor(CoordinatorEntity, SensorEntity):
-    """车辆状态：已熄火/驻车/空挡/行驶中"""
-    _attr_icon = "mdi:car-electric"
-    _attr_name = "车辆状态"
-
-    def __init__(self, coordinator: DataUpdateCoordinator, entry: ConfigEntry) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{entry.entry_id}_vehicle_state"
-        try:
-            self._vin = coordinator.data.get("vin", "") if coordinator.data else ""
-            self._device_name = coordinator.data.get("device_name", "吉利银河") if coordinator.data else "吉利银河"
-        except Exception:
-            self._vin = ""
-            self._device_name = "吉利银河"
-
-    @property
-    def device_info(self):
-        return {
-            "identifiers": {(DOMAIN, self._vin or self.unique_id)},
-            "name": self._device_name,
-            "manufacturer": "吉利银河",
-        }
-
-    @property
-    def native_value(self) -> str:
-        data = self.coordinator.data if self.coordinator.data else {}
-        vehicle_status = data.get("vehicle_status", {})
-
-        ign = _get_status_value(vehicle_status, ("ignitionOn", "engineOn", "engineStatus", "ignitionStatus", "powerStatus"))
-        gear = _get_status_value(vehicle_status, ("gearValue", "gearPosition", "gear", "currentGear", "shiftPosition"))
-        speed = _safe_float(_find_value_recursive(vehicle_status, ("speed", "vehicleSpeed", "currentSpeed", "drivingSpeed")))
-        if speed is None:
-            speed = _safe_float(_find_value_recursive(data, ("speed", "vehicleSpeed")))
-        epb = _get_status_value(vehicle_status, ("epbStatus", "parkBrakeStatus", "handbrakeStatus", "handBrakeStatus"))
-
-        attrs = {}
-        if speed is not None:
-            attrs["车速(km/h)"] = round(speed, 1)
-        if gear is not None:
-            attrs["挡位"] = gear
-        if ign is not None:
-            attrs["点火状态"] = ign
-        if epb is not None:
-            attrs["手刹"] = epb
-        self._attrs = attrs
-
-        is_ignition_on = ign in ("1", "ON", "on", "true", "True", True, 1, "start", "START")
-        is_moving = speed is not None and speed > 1.0
-
-        if not is_ignition_on:
-            return "已熄火"
-        if is_moving:
-            return "行驶中"
-        if gear in ("P", "p", "PARK", "park", "1", 1):
-            return "驻车(P挡)"
-        if gear in ("N", "n", "NEUTRAL", "neutral", "3", 3):
-            return "空挡(N挡)"
-        return "已挂挡"
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        _ = self.native_value
-        return getattr(self, "_attrs", {})
-
-
-class GeelyWindowStatusSensor(CoordinatorEntity, SensorEntity):
-    """车窗状态：全关/微开/全开/部分打开"""
-    _attr_icon = "mdi:car-door"
-    _attr_name = "车窗状态"
-
-    def __init__(self, coordinator: DataUpdateCoordinator, entry: ConfigEntry) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{entry.entry_id}_window_status"
-        try:
-            self._vin = coordinator.data.get("vin", "") if coordinator.data else ""
-            self._device_name = coordinator.data.get("device_name", "吉利银河") if coordinator.data else "吉利银河"
-        except Exception:
-            self._vin = ""
-            self._device_name = "吉利银河"
-
-    @property
-    def device_info(self):
-        return {
-            "identifiers": {(DOMAIN, self._vin or self.unique_id)},
-            "name": self._device_name,
-            "manufacturer": "吉利银河",
-        }
-
-    def _get_window_states(self):
-        data = self.coordinator.data if self.coordinator.data else {}
-        vs = data.get("vehicle_status", {})
-        wins = {"主驾": None, "副驾": None, "左后": None, "右后": None}
-        key_map = {
-            "主驾": ("windowStatusDriver", "driverWindowStatus", "frontLeftWindowStatus"),
-            "副驾": ("windowStatusPassenger", "passengerWindowStatus", "frontRightWindowStatus"),
-            "左后": ("windowStatusDriverRear", "driverRearWindowStatus", "rearLeftWindowStatus"),
-            "右后": ("windowStatusPassengerRear", "passengerRearWindowStatus", "rearRightWindowStatus"),
-        }
-        stat_map = {"1": "全开", "2": "全关", "3": "微开", 1: "全开", 2: "全关", 3: "微开"}
-        for pos, keys in key_map.items():
-            v = _find_value_recursive(vs, keys)
-            if v is not None:
-                wins[pos] = stat_map.get(str(v), f"未知({v})")
-        return wins
-
-    @property
-    def native_value(self) -> str:
-        wins = self._get_window_states()
-        states = [s for s in wins.values() if s is not None]
-        if not states:
-            return "未知"
-        self._wins = wins
-        if all(s == "全关" for s in states):
-            return "全关"
-        if all(s == "全开" for s in states):
-            return "全开"
-        if any(s == "微开" for s in states) and not any(s == "全开" for s in states):
             return "微开"
         return "部分打开"
 
     @property
+    def icon(self) -> str:
+        v = self.native_value
+        if v == "全关":
+            return "mdi:car-window-closed"
+        if v == "全开":
+            return "mdi:car-window-down"
+        if v == "微开":
+            return "mdi:car-window-arrows"
+        return "mdi:car-window"
+
+    @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        _ = self.native_value
-        return getattr(self, "_wins", {})
+        attrs: dict[str, Any] = self._each_window()
+        # 排障用：原样暴露车端块，便于核对字段名
+        vws = self.vehicle_status.get("vehicleWindowStatus")
+        if isinstance(vws, dict):
+            attrs["_raw_vehicleWindowStatus"] = vws
+        return attrs
 
 
-class GeelySunroofStatusSensor(CoordinatorEntity, SensorEntity):
-    """天窗状态：全关/微开/全开"""
-    _attr_icon = "mdi:weather-sunny"
+class GeelySunroofStatusSensor(GeelyBaseSensor):
+    """天窗状态（全关 / 部分打开 / 全开）。
+
+    银河A7（VC 通道）读数来自 ``vehicleWindowStatus.sunroofPos``（开度 %），
+    其次看 ``vehicleWindowStatus.sunroofOpenStatus``；
+    ``vehicleDoorCoverStatus.sunroofStatus`` 仅作老车型兜底。
+    """
+
     _attr_name = "天窗状态"
+    _attr_icon = "mdi:roof"
 
-    def __init__(self, coordinator: DataUpdateCoordinator, entry: ConfigEntry) -> None:
-        super().__init__(coordinator)
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_sunroof_status"
-        try:
-            self._vin = coordinator.data.get("vin", "") if coordinator.data else ""
-            self._device_name = coordinator.data.get("device_name", "吉利银河") if coordinator.data else "吉利银河"
-        except Exception:
-            self._vin = ""
-            self._device_name = "吉利银河"
+
+    def _raw_pair(self) -> tuple[Any, Any]:
+        """返回 (开度, 开关状态原始值)。"""
+        vs = self.vehicle_status
+        vws = vs.get("vehicleWindowStatus")
+        if isinstance(vws, dict):
+            pos = vws.get("sunroofPos")
+            raw = vws.get("sunroofOpenStatus")
+            if pos is not None or raw is not None:
+                return pos, raw
+        dc = vs.get("vehicleDoorCoverStatus")
+        if isinstance(dc, dict):
+            for k in ("sunroofStatus", "sunroofOpenStatus", "sunroofOpen"):
+                if dc.get(k) is not None:
+                    return None, dc.get(k)
+        return None, None
 
     @property
-    def device_info(self):
-        return {
-            "identifiers": {(DOMAIN, self._vin or self.unique_id)},
-            "name": self._device_name,
-            "manufacturer": "吉利银河",
-        }
+    def native_value(self) -> str | None:
+        pos, raw = self._raw_pair()
+        label = _pos_to_label(pos)
+        if label is not None:
+            return label
+        return _window_status_label(raw)
 
     @property
-    def native_value(self) -> str:
-        data = self.coordinator.data if self.coordinator.data else {}
-        vs = data.get("vehicle_status", {})
-        v = _find_value_recursive(vs, ("sunroofStatus", "skylightStatus", "sunRoofStatus"))
-        if v is None:
-            return "未知"
-        s = str(v)
-        if s in ("2",):
-            return "全关"
-        if s in ("1",):
-            return "全开"
-        if s in ("3", "半开", "ajar"):
-            return "微开"
-        return f"未知({v})"
+    def icon(self) -> str:
+        v = self.native_value
+        if v == "全关":
+            return "mdi:roof"
+        if v == "全开":
+            return "mdi:car-windshield-outline"
+        return "mdi:window-maximize"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        pos, raw = self._raw_pair()
+        return {"开度": pos, "open_status_raw": raw}
 
 
-class GeelySunshadeStatusSensor(CoordinatorEntity, SensorEntity):
-    """遮阳帘状态：全关/半开/全开"""
-    _attr_icon = "mdi:blinds"
+class GeelySunshadeStatusSensor(GeelyBaseSensor):
+    """遮阳帘状态（全关 / 部分打开 / 全开）。
+
+    银河A7（VC 通道）读数来自 ``vehicleWindowStatus.curtainPos``（开度 %），
+    其次看 ``vehicleWindowStatus.curtainOpenStatus``；
+    ``vehicleDoorCoverStatus.sunshadeStatus`` 仅作老车型兜底。
+    """
+
     _attr_name = "遮阳帘状态"
+    _attr_icon = "mdi:blinds"
 
-    def __init__(self, coordinator: DataUpdateCoordinator, entry: ConfigEntry) -> None:
-        super().__init__(coordinator)
+    _FALLBACK_KEYS = (
+        "sunshadeStatus", "skylightCurtainStatus", "sunCurtainStatus", "curtainStatus",
+    )
+
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_sunshade_status"
-        try:
-            self._vin = coordinator.data.get("vin", "") if coordinator.data else ""
-            self._device_name = coordinator.data.get("device_name", "吉利银河") if coordinator.data else "吉利银河"
-        except Exception:
-            self._vin = ""
-            self._device_name = "吉利银河"
+
+    def _raw_pair(self) -> tuple[Any, Any]:
+        """返回 (开度, 开关状态原始值)。"""
+        vs = self.vehicle_status
+        vws = vs.get("vehicleWindowStatus")
+        if isinstance(vws, dict):
+            pos = vws.get("curtainPos")
+            raw = vws.get("curtainOpenStatus")
+            if pos is not None or raw is not None:
+                return pos, raw
+        dc = vs.get("vehicleDoorCoverStatus")
+        if isinstance(dc, dict):
+            for k in self._FALLBACK_KEYS:
+                if dc.get(k) is not None:
+                    return None, dc.get(k)
+        return None, None
 
     @property
-    def device_info(self):
-        return {
-            "identifiers": {(DOMAIN, self._vin or self.unique_id)},
-            "name": self._device_name,
-            "manufacturer": "吉利银河",
-        }
+    def native_value(self) -> str | None:
+        pos, raw = self._raw_pair()
+        label = _pos_to_label(pos)
+        if label is not None:
+            return label
+        return _window_status_label(raw)
 
     @property
-    def native_value(self) -> str:
-        data = self.coordinator.data if self.coordinator.data else {}
-        vs = data.get("vehicle_status", {})
-        v = _find_value_recursive(vs, ("sunshadeStatus", "curtainStatus", "sunCurtainStatus", "skylightCurtainStatus"))
-        if v is None:
-            return "未知"
-        s = str(v)
-        if s in ("2", "0", "关闭"):
-            return "全关"
-        if s in ("1", "打开", "全开"):
-            return "全开"
-        if s in ("3", "半开"):
-            return "半开"
-        return f"未知({v})"
+    def icon(self) -> str:
+        v = self.native_value
+        if v == "全关":
+            return "mdi:blinds"
+        if v == "全开":
+            return "mdi:blinds-open"
+        return "mdi:blinds-horizontal"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        pos, raw = self._raw_pair()
+        return {"开度": pos, "open_status_raw": raw}
+
